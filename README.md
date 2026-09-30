@@ -4,7 +4,28 @@
 **底栏 5 个 tab（首页 / 车主服务 / 会员服务 / 商城 / 我的）精简到只剩「我的」**，
 并清掉**「我的」页中「我的订单」与「我的服务」之间的图片广告**（"移动积分兑高速通行券"横幅）。
 
-当前版本：**v0.1-probe —— 纯探针，只取证、不改任何界面行为。**
+当前版本：**v0.1.1-probe —— 纯探针，只取证、不改任何界面行为。**
+
+> **v0.1.1 修了什么（依据 = 2026-09-30 23:21:29 真机 .ips）**
+>
+> v0.1 在真机上**启动即闪退**（SIGBUS，0.18 秒）。.ips 显示崩溃帧属于**主二进制**
+> （`imgIdx=0`），我们的 dylib（`imgIdx=43`, `base=0x111ef0000`, `size=0x18000`）
+> **栈上一帧都没有** —— 但崩溃发生在 `dyld → runAllInitializersForMain → notifyObjCInit
+> → load_images`，即**宿主的 `+load` 正在执行时**，而 v0.1 的 `%ctor` 恰好在这个阶段
+> 做了三件有副作用的事：调 Foundation、用 `sigaction` 覆盖宿主 6 个信号处理器 +
+> `sigaltstack`、文件 IO。
+>
+> **dyld 阶段是别人的地盘。** 宿主若在 `+load` 里用信号做自检 / 反调试 / 崩溃收集
+> （国产 App 常见），我们的覆盖会把它变成真崩溃，而崩溃点自然落在它的代码上 ——
+> 与这份 .ips 的形状完全吻合。
+>
+> v0.1.1 因此把 `%ctor` 砍到**只剩一次 `dispatch_async`**，Foundation 调用、文件 IO、
+> 信号处理器全部推迟到主队列（runloop 已起来、宿主 `+load` 已跑完）执行。
+> 信号处理器**默认关闭**（`ENABLE_CRASH_HANDLERS 0`），代价是失去"爆栈/无限递归"的
+> 现场取证 —— 那类崩溃系统 .ips 里同样有完整栈，本次这个崩溃正是靠 .ips 定位的。
+>
+> 顺带修正：bundle id 实测为 **`com.sdhsie.westeros.weirwood`**，
+> 不是之前从 Android 包名推断的 `com.sdhs.easy.high.road`（推断错了）。
 
 ---
 
@@ -97,11 +118,10 @@ python tools/preflight.py Tweak.xm     # 退出码 0 = 可以推送
 
 | 项 | 状态 |
 |---|---|
-| **Bundle ID** | 用 `com.sdhs.easy.high.road`。来源：小米应用商店 / 应用宝 / OPPO 之家三处 **Android 包名一致**。**iOS 端 bundle id 未核实**，双端通常一致但不保证 |
-| 该假设的实际影响 | **低**。TrollFools 是改 App 的 Mach-O 直接注入 dylib，由 dyld 无条件加载，`%ctor` 必然执行 —— `plist` 里的 `Filter` 是 Cydia/ellekit 那套机制，注入模式下不参与判定。**但若改用 deb 安装（Sileo/Zebra），Filter 就必须准确** |
-| 核实方法 | TrollFools 里选中「e高速」时会显示 bundle id；或看 IPA 解包后的 `Info.plist` |
-| 界面结构 | 全部未知，v0.1 不做任何界面改动 |
-| 目标 App 版本 | 未知。截图未标版本号，请在回传 dump 时一并告知 App 版本 |
+| **Bundle ID** | ✅ **已实测**：`com.sdhsie.westeros.weirwood`（来源：2026-09-30 真机 .ips）。此前写的 `com.sdhs.easy.high.road` 是从小米/应用宝/OPPO 三处 **Android 包名推断**的 —— **推断错了**。iOS 与 Android 的 bundle id 不保证一致，这条只能靠实测 |
+| **目标 App 版本** | ✅ **已实测**：e高速 **5.10.7**（build 2），运行在 iOS 16.6.1 |
+| 界面结构 | **仍全部未知**。v0.1 在真机上启动即崩（见顶部 v0.1.1 说明），还没走到界面。等 v0.1.1 确认能正常启动后再取 dump |
+| TrollFools 注入与 plist Filter | 注入模式下 `Filter` 不参与判定（dylib 由 dyld 无条件加载）—— 本次崩溃的 .ips 里确实出现了 `EGaosuTidy.dylib`，印证了这点。但若改用 deb 安装（Sileo/Zebra），Filter 必须准确，所以已同步改为实测值 |
 
 ---
 

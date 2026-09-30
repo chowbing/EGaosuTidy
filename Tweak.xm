@@ -92,10 +92,20 @@
 // ============================== 配置 ==============================
 
 #define EG_TAG              "EGaosuTidy"
-#define EG_VERSION          "0.1-probe"
-#define EG_BUNDLE_ID        "com.sdhs.easy.high.road"
+#define EG_VERSION          "0.1.1-probe"
+// ★ bundle id：真机 .ips 实测（2026-09-30 23:21:29）是 com.sdhsie.westeros.weirwood。
+//   之前写的 com.sdhs.easy.high.road 是从三个 Android 商店包名**推断**的 —— 推断错了。
+//   iOS 与 Android 的 bundle id 不保证一致，这条只能靠实测。
+#define EG_BUNDLE_ID        "com.sdhsie.westeros.weirwood"
 
-#define ENABLE_CRASH_LOG         1   // 崩溃取证（signal + exception + 阶段标记）
+#define ENABLE_CRASH_LOG         1   // 崩溃取证（阶段标记 + 日志回读）
+// ★ 信号处理器开关，默认 **0（关）** —— v0.1.1 的改动之一。
+//   理由见 %ctor 上方那段：v0.1 在 dyld 阶段用 sigaction 覆盖了宿主 6 个信号处理器
+//   并 sigaltstack 覆盖备用栈，那是在**别人的初始化过程中**动别人的地基。宿主若在
+//   +load 里用信号做自检 / 反调试，我们的覆盖会把它变成真崩溃。
+//   关掉只损失"爆栈 / 无限递归"的现场取证 —— 那类崩溃系统 .ips 里同样有完整栈，
+//   本次这个崩溃（v0.1 真机 SIGBUS）就是靠 .ips 定位的，不是靠这个处理器。
+#define ENABLE_CRASH_HANDLERS    0
 #define ENABLE_FLOAT_BUTTON      1   // 悬浮按钮
 #define ENABLE_TABBAR_FORENSICS  1   // 底栏构造取证
 #define ENABLE_CLASS_SCAN        1   // 全进程类名扫描（一次性，启动后跑）
@@ -182,12 +192,14 @@ static UIView *EGRootViewOfCurrentScreen(void);
 
 static BOOL EGIsH5Hosted(UIView *v);
 static BOOL EGIsBannerShaped(UIView *v);
+static NSString *EGTextOfView(UIView *v);
 static NSString *EGNodeTagOf(UIView *v);
 static NSString *EGDescribeNode(UIView *v, NSString *indent);
 static void EGWalkNode(UIView *v, NSUInteger depth, NSUInteger maxDepth,
                        NSUInteger *budget, NSMutableString *s);
 static NSString *EGDumpViewTree(UIView *root, NSUInteger maxDepth, NSUInteger maxNodes);
 static NSString *EGBannerCandidates(UIView *root);
+static NSString *EGTextIndex(UIView *root);
 
 static void EGCollectTabBarControllers(UIViewController *vc, NSMutableArray *out, NSUInteger depth);
 static NSArray *EGFindTabBarControllers(void);
@@ -1295,8 +1307,24 @@ static void EGInstallViewDidAppearHook(void) {
 static void EGEnsureStarted(void) {
     if (gEGStarted) return;
     gEGStarted = YES;
+
+    // ---- 以下三件事在 v0.1 里是 %ctor（dyld 阶段）做的，v0.1.1 全部挪到这里 ----
+    // 现在跑在主队列上：runloop 已起来，Foundation / 文件系统 / 信号都安全，
+    // 而且宿主自己的 +load 已经跑完了 —— 完整依据见 %ctor 上方那段。
+    EGInitCrashLogPath();
+#if ENABLE_CRASH_HANDLERS
+    EGInstallCrashHandlers();
+#else
+    // 不装：避免在宿主的初始化链里覆盖它自己的信号处理器（见配置区的说明）
+#endif
+    int guardCount = EGLaunchGuardCheck();
+    if (guardCount != 0) gEGGuardTripped = YES;
+
     EGStageSet("启动完成");
     EGDiag(@"[启动] %@ %@ 已加载（bundle=%s）", @EG_TAG, @EG_VERSION, EG_BUNDLE_ID);
+#if !ENABLE_CRASH_HANDLERS
+    EGDiag(@"[启动] 信号处理器未装（ENABLE_CRASH_HANDLERS=0）—— 不覆盖宿主自己的");
+#endif
 
     @synchronized (@"EGVCLive") {
         if (!gEGVCLive) gEGVCLive = [NSHashTable weakObjectsHashTable];
@@ -1348,22 +1376,46 @@ static void EGEnsureStarted(void) {
 }
 
 // ============================== 入口 ==============================
-
+//
+// ★★ v0.1.1 的关键改动：%ctor 里**只留一次 dispatch_async**，别的什么都不做。
+//
+// 依据 = 2026-09-30 23:21:29 真机 .ips（Shawn 提供，e高速 5.10.7 / iOS 16.6.1）：
+//   exception  EXC_CRASH / SIGBUS（Bus error: 10）
+//   启动→崩溃  0.18 秒
+//   栈        #0 e高速 +0x51f21e8
+//             #1 e高速 +0x59c1d40
+//             #2 load_images                        [libobjc.A.dylib]
+//             #3 dyld4::RuntimeState::notifyObjCInit
+//             #4 dyld4::Loader::runInitializersBottomUp
+//             ...
+//             #8 dyld4::APIs::runAllInitializersForMain
+//   —— 即**某个 image 的 +load 正在执行时**崩的。
+//
+// 归属判定（这一条必须说清楚，不能含糊）：
+//   我们 dylib 的 imageIndex=43、base=0x111ef0000、size=0x18000；
+//   而崩溃帧 #0/#1 的 imageIndex=0 = **主二进制 e高速**
+//   （base=0x104588000、size=0x7c70000，偏移 0x51f21e8 确实落在其范围内）。
+//   → **栈上没有任何一帧属于我们的 dylib。**
+//
+// 但"不在栈上" ≠ "无责任"。v0.1 的 %ctor 在 **dyld 初始化阶段**做了三件有副作用的事：
+//   ① 调 Foundation（NSSearchPathForDirectoriesInDomains）—— 在别人的初始化链里触发 lazy init
+//   ② 用 sigaction 覆盖宿主 6 个信号处理器 + sigaltstack 覆盖备用信号栈
+//   ③ 文件 IO（读 / 写 Caches 下的启动计数文件）
+// 这些全都发生在**宿主自己的初始化过程之中**。宿主若在 +load 里用信号做自检 / 反调试 /
+// 崩溃收集（国产 App 常见），我们的覆盖会把它的"自检"变成"真崩溃"，而崩溃点自然落在
+// 它的代码上 —— 与这份 .ips 的形状完全吻合。
+//
+// dyld 阶段是**别人的地盘**。我们唯一该做的是尽快让开：
+// 把 Foundation 调用、文件 IO、信号处理器全部推迟到主队列（runloop 已起来）执行。
+//
+// 代价（如实记录）：如果在主队列块执行之前宿主就崩了，我们的崩溃取证抓不到那一次。
+// 但那种情况下系统 .ips 本来就有完整记录 —— 本次这个崩溃正是靠 .ips 定位的，
+// 不是靠我们的取证，所以不算净损失。
+//
+// 另：日志顺序改为"先 EGEnsureStarted，再由它自己初始化崩溃日志路径"，
+// 因为 EGInitCrashLogPath 要调 Foundation。
 %ctor {
-    @autoreleasepool {
-        EGInitCrashLogPath();
-        EGInstallCrashHandlers();
-
-        int guardCount = EGLaunchGuardCheck();
-        if (guardCount != 0) {
-            gEGGuardTripped = YES;
-        }
-
-        // 这里必须用 dispatch_async，**不能**用"是主线程就直接跑"的变体：
-        // dyld 的初始化就跑在主线程上，直接跑会把诊断放回启动路径。
-        // 主队列在 UIApplicationMain 启动 runloop 之前不会执行 —— 这是**结构性**保证。
-        dispatch_async(dispatch_get_main_queue(), ^{
-            EGEnsureStarted();
-        });
-    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        EGEnsureStarted();
+    });
 }

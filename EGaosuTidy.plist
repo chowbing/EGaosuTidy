@@ -1,5 +1,5 @@
 {
-  Filter = {
-    Bundles = ( "com.sdhs.easy.high.road" );
+  "Filter = {
+    "Bundles = ( "com.sdhsie.westeros.weirwood" );
   };
 }
