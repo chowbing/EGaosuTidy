@@ -1,12 +1,23 @@
 // ============================================================================
-// Tweak.xm — e高速 (com.sdhs.easy.high.road) 界面精简 Tweak
-// v0.1-probe —— **纯探针：只取证，不改任何界面行为**
+// Tweak.xm — e高速 (com.sdhsie.westeros.weirwood) 界面精简 Tweak
+// v0.1.2-probe —— **纯探针：只取证，不改任何界面行为**
 // ============================================================================
 //
 // 目标（Shawn 提出，2026-09-30）：
 //   1) 底栏 5 个 tab（首页 / 车主服务 / 会员服务 / 商城 / 我的）→ **只保留「我的」**；
 //   2) 「我的」页中，「我的订单」与「我的服务」之间的**图片广告**
 //      （「移动积分兑高速通行券」横幅）一并去掉。
+//
+// ---------------------------------------------------------------------------
+// v0.1.2 相对 v0.1.1 改了什么（三件，全部有据）
+// ---------------------------------------------------------------------------
+//   ① **削减**：探针阶段关掉 UIViewController.viewDidAppear: 钩子
+//      （ENABLE_VIEWDIDAPPEAR_HOOK 0）。收益≈0、风险>0 —— 理由见配置区。
+//   ② **判定仪器**：新增「启动流水」+「崩溃时自动镜像到剪贴板」。
+//      两次崩溃我们的代码都**不在崩溃栈上**，光看 .ips 无法回答"我们走到哪一步了"。
+//      流水每启动一行，崩溃后粘贴剪贴板就知道停在哪。
+//   ③ **一次问完**：构建变体机制 —— 一轮 CI 出 4 个 dylib（minimal / dispatchonly /
+//      nofloat / normal），把"是不是我们引起的"拆成互不重叠的台阶。见配置区那一节。
 //
 // ---------------------------------------------------------------------------
 // 为什么 v0.1 是纯探针，而不是直接写规则
@@ -32,7 +43,13 @@
 //   右上角出现一个蓝色圆点 **EG**（可拖动）：
 //     · **点一下** = 抓当前页面 → 底栏取证 + 当前页视图树 + 广告候选汇总
 //                    → 写入剪贴板，按钮标题闪一下显示抓到的字节数（自证"点到了"）
-//     · **长按**   = 完整诊断（含启动期自动 dump、崩溃日志回读、类名扫描）→ 写入剪贴板
+//     · **长按**   = 完整诊断（含**启动流水**、启动期自动 dump、崩溃日志回读、类名扫描）→ 写入剪贴板
+//
+//   ★ 如果 App 启动就闪退（悬浮球根本来不及出现）：
+//     本次启动检测到**上一次没正常结束**时，会**自动把启动流水写进系统剪贴板**。
+//     所以：闪退之后**直接粘贴**，就能把「我们崩在哪一步」的证据拿出来 ——
+//     不需要 Filza，也不需要翻 App 容器目录。
+//     也可以手动看文件：<App 容器>/Library/Caches/eg_tidy_journal.txt
 //
 //   请按这个顺序跑，然后把两次粘贴的内容发回：
 //     第 1 步：停在任意**底栏可见**的页面，点一下 EG → 回答 Q1 / Q2
@@ -49,10 +66,11 @@
 // ---------------------------------------------------------------------------
 // 安全设计（每条都对应本项目翻过的一次车，详见 skill ios-theos-dylib-ci）
 // ---------------------------------------------------------------------------
-//   · %ctor 只做三件事：算崩溃日志路径、装崩溃处理器、把其余全部 dispatch 到主队列。
+//   · %ctor **只做一件事**：一次 dispatch_async，其余全部丢到主队列。
 //     诊断钩子绝不放在启动路径上 —— 一次"在 dyld 阶段全进程扫类"曾把目标 App
 //     打到**完全打不开**（且 @try/@catch 救不了：异常在 dispatch_once 里被 libdispatch
 //     边界吞成 std::terminate）。
+//     v0.1 在这里翻过车（%ctor 里调 Foundation + 覆盖宿主信号处理器），v0.1.1 修掉。
 //   · 查方法一律 class_copyMethodList 手走父类链，**绝不用 class_getInstanceMethod**
 //     —— 后者会强制 +initialize，全进程遍历等于让每个类都在 dyld 阶段初始化一次。
 //   · 只 hook **一个类的一个 selector**（UIViewController.viewDidAppear:），
@@ -85,6 +103,9 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
+#include <time.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 // 不依赖 substrate / ellekit 头文件：直接用 Objective-C runtime 替换方法实现。
 // TrollFools 注入的进程内同样可用，同时消掉一类"头文件找不到"的构建失败。
@@ -92,7 +113,7 @@
 // ============================== 配置 ==============================
 
 #define EG_TAG              "EGaosuTidy"
-#define EG_VERSION          "0.1.1-probe"
+#define EG_VERSION          "0.1.2-probe"
 // ★ bundle id：真机 .ips 实测（2026-09-30 23:21:29）是 com.sdhsie.westeros.weirwood。
 //   之前写的 com.sdhs.easy.high.road 是从三个 Android 商店包名**推断**的 —— 推断错了。
 //   iOS 与 Android 的 bundle id 不保证一致，这条只能靠实测。
@@ -110,6 +131,40 @@
 #define ENABLE_TABBAR_FORENSICS  1   // 底栏构造取证
 #define ENABLE_CLASS_SCAN        1   // 全进程类名扫描（一次性，启动后跑）
 #define ENABLE_AUTO_DUMP         1   // 启动后自动 dump 一次底栏（用户没点也能拿到数据）
+
+// ★ 探针阶段默认**不装** UIViewController.viewDidAppear: 钩子（v0.1.2 的削减）。
+//   收益≈0：探针的全部产出靠「点 EG」+ 启动后定时 dump 拿到，这个钩子只额外补一条
+//   「VC 首次出现」的日志。
+//   风险>0：它要在宿主**最热的类**上换 IMP。宿主若有方法完整性校验 / 方法 IMP 表比对，
+//   这正好是最容易被发现的一处 —— 而探针阶段我们**不需要**这个信息。
+//   收益≈0、风险>0 的事，探针不做。（规则版需要它，到时候再开。）
+#define ENABLE_VIEWDIDAPPEAR_HOOK 0
+
+// ★ 启动流水（v0.1.2 新增）—— 判定「是不是我们引起的」的**直接证据**。
+//   场景：App 启动 0.5 秒即崩，我们的代码**不在崩溃栈上**（两次 .ips 都是这样）。
+//   那到底我们走到哪一步了？光看系统 .ips 答不了这个问题。
+//   做法：每次启动往 Caches/eg_tidy_journal.txt 追加一行「单调时钟毫秒 + 阶段名 + 变体名」。
+//   崩溃后读这个文件就知道：
+//     · 连 ctor 那一行都没有 → 我们的构造函数根本没跑（崩在 dyld 更早的阶段）
+//     · 停在某一行           → 崩在那一行**之后**、下一行之前 —— 这就是定位
+//   写入用纯 POSIX open/write/close + clock_gettime，**不碰 Foundation**
+//   （早期阶段 Foundation 未必可用，且碰 Foundation 本身就是 v0.1 翻车的原因之一）。
+#define ENABLE_LAUNCH_JOURNAL    1
+
+// ★ 流水镜像到剪贴板（v0.1.2 新增）—— 解决"App 崩了就点不到悬浮球"的死结。
+//   悬浮球是读流水的唯一入口，可 App 一崩，悬浮球也就没了 —— 这是个死循环。
+//   破法：**上一次启动没有走到 confirmed 时**（即大概率崩过），本次启动就把流水
+//   写进**系统剪贴板**。剪贴板跨进程存活，崩溃后 Shawn 直接粘贴就能把证据拿出来，
+//   不需要 Filza、不需要翻容器目录。
+//   只在"上次没正常结束"时才写 —— 正常使用时不会反复覆盖你的剪贴板。
+#define EG_JOURNAL_MIRROR        1
+
+// 是否允许在 %ctor（dyld 阶段）写一行启动流水。
+//   默认 **0** —— dyld 阶段是别人的地盘，v0.1 就是在这里翻的车。
+//   只有 dispatchonly 变体打开：那一版的目的正是**测 %ctor 本身**，
+//   而 open/write/close 是三个 syscall，比 v0.1 做的三件事（Foundation 初始化 +
+//   sigaction 覆盖宿主 6 个信号处理器 + sigaltstack）轻得多，风险可接受。
+#define EG_JOURNAL_IN_CTOR       0
 
 // 诊断缓冲上限（滚动窗口保留最新 N 字符，超出即丢弃**最旧**的部分并标记截断）
 #define EG_DIAG_CAP          200000
@@ -136,6 +191,69 @@
 //   默认 0。
 #define EG_MINIMAL_CTOR          0
 
+// ============================================================================
+// ★★ 构建变体（v0.1.2）—— 一轮 CI 出 4 个 dylib，把「是不是我们引起的」一次问完
+// ============================================================================
+//
+// 为什么做成变体而不是一版一版试：每一版 = 一轮 CI + 一次真机注入。
+// 把"我们的代码在哪一步出错"拆成**互不重叠的台阶**，一轮全出，真机上按顺序注入即可定位。
+//
+//   台阶 0  (手动)   TrollFools 里**移除** dylib 后启动   → 测「宿主自身 / 环境」
+//   台阶 1  minimal     %ctor 完全为空（连 NSLog 都不调） → 测「我们的镜像被 dyld 加载」本身
+//   台阶 2  dispatchonly %ctor 只写一行流水 + 一次 dispatch_async，块里什么都不做
+//                                                        → 测「在 %ctor 里碰 libdispatch」
+//   台阶 3  nofloat     完整启动流程，但不装悬浮球        → 测「窗口 / 定时器 / 视图操作」
+//   台阶 4  normal      完整探针（正式取数用）
+//
+// 判读规则（结合启动流水交叉验证，不需要额外跑轮次）：
+//   台阶 0 就崩              → 与我们无关（宿主自身问题）
+//   台阶 0 不崩、台阶 1 崩    → 镜像存在即被检测（反注入 / 完整性校验）
+//   台阶 1 不崩、台阶 2 崩    → 看流水：
+//                               有 ctor、无 main-block → dispatch_async 本身出问题
+//                               两者都没有            → 构造函数第一条语句就没跑成
+//   台阶 2 不崩、台阶 3 崩    → 悬浮球 / 窗口 / 定时器
+//   台阶 3 不崩、台阶 4 崩    → 只剩延迟任务（viewDidAppear 钩子已默认关）
+//
+// 为什么 dispatchonly 要在 %ctor 里写一行流水：这样"崩在 ctor 里"和"崩在 dispatch_async 里"
+// 能分开 —— 只看 .ips 是分不开的（两者都不带我们的帧）。代价是 dyld 阶段多三个 syscall
+// （open/write/close），比 v0.1 在那个阶段做的事（Foundation 初始化 + sigaction 覆盖宿主
+// 6 个信号处理器 + sigaltstack）轻得多。**这是刻意的取舍，不是疏忽。**
+//
+// CI 侧通过 -DEG_VARIANT_xxx=1 选择（见 Makefile 的 EG_VARIANT）；本机默认 normal。
+#ifndef EG_VARIANT_MINIMAL
+#  define EG_VARIANT_MINIMAL      0
+#endif
+#ifndef EG_VARIANT_DISPATCHONLY
+#  define EG_VARIANT_DISPATCHONLY 0
+#endif
+#ifndef EG_VARIANT_NOFLOAT
+#  define EG_VARIANT_NOFLOAT      0
+#endif
+
+#if EG_VARIANT_MINIMAL
+#  define EG_VARIANT_TAG "minimal"
+#elif EG_VARIANT_DISPATCHONLY
+#  define EG_VARIANT_TAG "dispatchonly"
+#elif EG_VARIANT_NOFLOAT
+#  define EG_VARIANT_TAG "nofloat"
+#else
+#  define EG_VARIANT_TAG "normal"
+#endif
+
+// 变体对既有开关的覆盖（#undef 后再 define，保证命令行 -D 与文件内默认值不打架）
+#if EG_VARIANT_MINIMAL
+#  undef EG_MINIMAL_CTOR
+#  define EG_MINIMAL_CTOR 1
+#endif
+#if EG_VARIANT_DISPATCHONLY
+#  undef EG_JOURNAL_IN_CTOR
+#  define EG_JOURNAL_IN_CTOR 1
+#endif
+#if EG_VARIANT_NOFLOAT
+#  undef ENABLE_FLOAT_BUTTON
+#  define ENABLE_FLOAT_BUTTON 0
+#endif
+
 // 类名扫描关键词（只用来**报告**，不用来改行为）
 #define EG_SCAN_KEYWORDS_TAB   @[@"TabBar", @"Tabbar", @"TabItem", @"TabButton", @"TabView", @"TabController", @"BottomBar", @"MainTab"]
 #define EG_SCAN_KEYWORDS_AD    @[@"Banner", @"Advert", @"AdView", @"Promot", @"Popup", @"Splash", @"Market", @"Operat"]
@@ -144,6 +262,7 @@
 // ============================== 全局（全部前置，避免"先用后定义"） ==============================
 
 static char gEGCrashLogPath[512] = {0};
+static char gEGJournalPath[512]  = {0};
 static volatile const char *gEGStage = "启动";
 
 static NSMutableString *gEGDiag = nil;
@@ -178,6 +297,13 @@ static void EGInitCrashLogPath(void);
 static void EGInstallCrashHandlers(void);
 static void EGReadBackCrashLog(void);
 
+// 启动流水：纯 POSIX，异步信号安全，早期（含 %ctor）也能写
+static void EGInitJournalPath(void);
+static void EGJournal(const char *stage);
+static void EGJournalRotate(void);
+static NSString *EGJournalTail(NSUInteger maxBytes);
+static BOOL EGLastLaunchUnclean(void);
+
 static const char *EGBuildToken(void);
 static int  EGLaunchGuardCheck(void);
 static void EGLaunchGuardClear(void);
@@ -200,14 +326,12 @@ static UIView *EGRootViewOfCurrentScreen(void);
 
 static BOOL EGIsH5Hosted(UIView *v);
 static BOOL EGIsBannerShaped(UIView *v);
-static NSString *EGTextOfView(UIView *v);
 static NSString *EGNodeTagOf(UIView *v);
 static NSString *EGDescribeNode(UIView *v, NSString *indent);
 static void EGWalkNode(UIView *v, NSUInteger depth, NSUInteger maxDepth,
                        NSUInteger *budget, NSMutableString *s);
 static NSString *EGDumpViewTree(UIView *root, NSUInteger maxDepth, NSUInteger maxNodes);
 static NSString *EGBannerCandidates(UIView *root);
-static NSString *EGTextIndex(UIView *root);
 
 static void EGCollectTabBarControllers(UIViewController *vc, NSMutableArray *out, NSUInteger depth);
 static NSArray *EGFindTabBarControllers(void);
@@ -224,7 +348,9 @@ static void EGSetClipboard(NSString *text);
 static void EGFlashButton(NSString *text);
 static void EGInstallOverlay(void);
 
+#if ENABLE_VIEWDIDAPPEAR_HOOK
 static void EGViewDidAppearHook(id self, SEL _cmd, BOOL animated);
+#endif
 static void EGInstallViewDidAppearHook(void);
 static void EGEnsureStarted(void);
 static void EGCaptureCurrentPage(NSString *why);
@@ -255,6 +381,119 @@ static void EGInitCrashLogPath(void) {
         memcpy(gEGCrashLogPath, utf8, n);
         gEGCrashLogPath[n] = '\0';
     }
+}
+
+// ---------------------------------------------------------------------------
+// 启动流水
+// ---------------------------------------------------------------------------
+// 为什么**不走 Foundation**：这个函数要在 %ctor（dyld 阶段）也能调。
+// 而 v0.1 翻车的三件事之一就是"在 dyld 阶段调 Foundation"。
+// getenv("HOME") 读的是 dyld 早就铺好的 environ，纯 libc，零副作用。
+// iOS 上 App 进程的 HOME 就是自己的容器根，Caches 恒为 $HOME/Library/Caches。
+static void EGInitJournalPath(void) {
+    if (gEGJournalPath[0]) return;
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) return;
+    char buf[512];
+    int n = snprintf(buf, sizeof(buf), "%s/Library/Caches/eg_tidy_journal.txt", home);
+    if (n <= 0) return;
+    size_t m = ((size_t)n < sizeof(buf)) ? (size_t)n : (sizeof(buf) - 1);
+    if (m >= sizeof(gEGJournalPath)) m = sizeof(gEGJournalPath) - 1;
+    memcpy(gEGJournalPath, buf, m);
+    gEGJournalPath[m] = '\0';
+}
+
+// 流水超过 128 KB 就整份丢掉重来（每次启动检查一次，够廉价）。
+// 不设上限的话，一天开关几十次就会攒出几 MB 的无用文件。
+static void EGJournalRotate(void) {
+#if ENABLE_LAUNCH_JOURNAL
+    if (!gEGJournalPath[0]) return;
+    struct stat st;
+    if (stat(gEGJournalPath, &st) == 0 && st.st_size > (off_t)(128 * 1024)) {
+        unlink(gEGJournalPath);
+    }
+#endif
+}
+
+// 追加一行：<单调秒.毫秒>  <阶段>  [<变体>]
+// 用**单调时钟**不用墙上时钟：格式化日期要碰 Foundation，且墙上时钟会跳。
+// 单调秒是进程内相对时间，配合 .ips 的 uptime 正好能对上（.ips 也是这么算的）。
+static void EGJournal(const char *stage) {
+#if ENABLE_LAUNCH_JOURNAL
+    if (!stage) return;
+    EGInitJournalPath();
+    if (!gEGJournalPath[0]) return;
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return;
+    char line[256];
+    int n = snprintf(line, sizeof(line), "%lld.%03ld  %s  [%s]\n",
+                     (long long)ts.tv_sec, ts.tv_nsec / 1000000L, stage, EG_VARIANT_TAG);
+    if (n <= 0) return;
+    size_t len = ((size_t)n < sizeof(line)) ? (size_t)n : (size_t)(sizeof(line) - 1);
+    int fd = open(gEGJournalPath, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    ssize_t ig = write(fd, line, len);
+    (void)ig;
+    close(fd);
+#else
+    (void)stage;
+#endif
+}
+
+// 读回流水尾部 —— 长按 EG 的完整诊断里会带上它，这样 Shawn 不用去翻文件系统
+static NSString *EGJournalTail(NSUInteger maxBytes) {
+#if ENABLE_LAUNCH_JOURNAL
+    @autoreleasepool {
+        EGInitJournalPath();
+        if (!gEGJournalPath[0]) return @"(流水路径未初始化)";
+        NSString *p = [NSString stringWithUTF8String:gEGJournalPath];
+        NSData *d = [NSData dataWithContentsOfFile:p];
+        if (!d || d.length == 0) return @"(流水文件为空或不存在)";
+        NSData *tail = d;
+        BOOL cut = NO;
+        if (d.length > maxBytes) {
+            tail = [d subdataWithRange:NSMakeRange(d.length - maxBytes, maxBytes)];
+            cut = YES;
+        }
+        NSString *s = [[NSString alloc] initWithData:tail encoding:NSUTF8StringEncoding];
+        if (!s) return @"(流水不是合法 UTF-8)";
+        if (cut) return [@"…（只显示尾部）…\n" stringByAppendingString:s];
+        return s;
+    }
+#else
+    (void)maxBytes;
+    return @"(ENABLE_LAUNCH_JOURNAL=0)";
+#endif
+}
+
+// 判读「上一次启动是否异常结束」。
+// 必须**在写本次 ensure-start 之前**调用 —— 否则从后往前找到的第一个 ensure-start
+// 就是本次这一行，而它后面当然没有 confirmed，会永远判成"异常"。
+// 逻辑：从后往前定位**最后一个** ensure-start（= 上一次启动的开头），
+//       看它之后到文件末尾之间有没有 confirmed。没有 = 上次没走完 = 异常结束。
+static BOOL EGLastLaunchUnclean(void) {
+#if ENABLE_LAUNCH_JOURNAL
+    @autoreleasepool {
+        NSString *tail = EGJournalTail(8192);
+        if (!tail.length) return NO;
+        NSArray *lines = [tail componentsSeparatedByString:@"\n"];
+        NSInteger lastStart = -1;
+        for (NSInteger i = (NSInteger)lines.count - 1; i >= 0; i--) {
+            NSString *l = lines[(NSUInteger)i];
+            if ([l rangeOfString:@"ensure-start"].location != NSNotFound) {
+                lastStart = i;
+                break;
+            }
+        }
+        if (lastStart < 0) return NO;
+        for (NSUInteger i = (NSUInteger)lastStart; i < lines.count; i++) {
+            if ([lines[i] rangeOfString:@"confirmed"].location != NSNotFound) return NO;
+        }
+        return YES;
+    }
+#else
+    return NO;
+#endif
 }
 
 // 崩溃日志写入：只用 open/write/close（异步信号安全）。
@@ -1182,7 +1421,7 @@ static void EGCaptureCurrentPage(NSString *why) {
                     [out appendFormat:@"  %@\n", n];
                 }
             } else {
-                [out appendString:@"  (还没记录到任何 VC —— hook 可能尚未生效)\n"];
+                [out appendString:@"  (本会话还没记录到 VC —— ENABLE_VIEWDIDAPPEAR_HOOK=0 时这是预期的)\n"];
             }
         }
 
@@ -1206,8 +1445,14 @@ static void EGCaptureFull(void) {
 
         [out appendFormat:@"########## %@ 完整诊断 @ %@ ##########\n",
             @EG_TAG, [df stringFromDate:[NSDate date]]];
-        [out appendFormat:@"版本 = %@   构建令牌 = %s\n", @EG_VERSION, EGBuildToken()];
+        [out appendFormat:@"版本 = %@   变体 = %s   构建令牌 = %s\n",
+            @EG_VERSION, EG_VARIANT_TAG, EGBuildToken()];
         [out appendFormat:@"阶段 = %s\n", EGStageText()];
+
+        // ★ 启动流水：判定「是不是我们引起的」的直接证据。
+        //   每次启动一行「单调时钟 + 阶段 + 变体」。若某次启动崩了，这一行就停在崩之前的最后一步。
+        [out appendString:@"\n===== 启动流水（最近若干次启动） =====\n"];
+        [out appendFormat:@"%@\n", EGJournalTail(4096)];
 
         [out appendString:@"\n===== 上次崩溃回读 =====\n"];
         EGReadBackCrashLog();
@@ -1256,6 +1501,12 @@ static void EGCaptureFull(void) {
 }
 
 // ============================== hook ==============================
+//
+// ★ v0.1.2：整段用 ENABLE_VIEWDIDAPPEAR_HOOK 包起来，**探针阶段默认关闭**。
+//   收益≈0：探针的产出靠「点 EG」+ 启动后定时 dump，这个钩子只多一条「VC 首次出现」日志。
+//   风险>0：要在宿主**最热的类**上换 IMP；宿主若有方法完整性校验，这是最显眼的一处。
+//   顺带好处：关掉后这一整段不参与编译，也就不存在"未使用函数"这类告警。
+#if ENABLE_VIEWDIDAPPEAR_HOOK
 
 // 一个类、一个 selector、一个 shim、一个全局 orig IMP。
 //   绝不装"每个实现类各一份"的通用安装器：共享 shim 无法区分直接调用与 [super] 调用
@@ -1310,16 +1561,38 @@ static void EGInstallViewDidAppearHook(void) {
            (void *)gEGOrigViewDidAppear);
 }
 
+#else   // !ENABLE_VIEWDIDAPPEAR_HOOK
+
+// 关掉时给一个**有日志**的空实现，让 EGEnsureStarted 的调用点不必再包 #if（少一处出错机会）。
+// 关键：不写"完全空"，而是写明确日志 —— 这样看诊断的人一眼能区分
+//   「钩子被主动关掉了」 与 「钩子装了但没生效」。
+// 这两种情况在诊断文本里必须能分开，否则会得出相反结论。
+static void EGInstallViewDidAppearHook(void) {
+    EGDiag(@"[hook] viewDidAppear: 钩子**主动关闭**（ENABLE_VIEWDIDAPPEAR_HOOK=0）");
+}
+
+#endif  // ENABLE_VIEWDIDAPPEAR_HOOK
+
 // ============================== 启动 ==============================
 
 static void EGEnsureStarted(void) {
     if (gEGStarted) return;
     gEGStarted = YES;
 
+    // ★ 判读上一次启动是否异常结束 —— **必须在写本次 ensure-start 之前**
+    //   （原因见 EGLastLaunchUnclean 的注释：先写就会把本次这一行当成"上一次"）。
+    BOOL lastUnclean = EGLastLaunchUnclean();
+
+    // 流水第一行：能走到这里，说明「%ctor 的 dispatch_async 块」真的被主队列执行了。
+    // 这一行是整个判定链的锚点 —— 如果崩溃后流水里连它都没有，就说明崩在它之前。
+    EGJournal("ensure-start");
+
     // ---- 以下三件事在 v0.1 里是 %ctor（dyld 阶段）做的，v0.1.1 全部挪到这里 ----
     // 现在跑在主队列上：runloop 已起来，Foundation / 文件系统 / 信号都安全，
     // 而且宿主自己的 +load 已经跑完了 —— 完整依据见 %ctor 上方那段。
     EGInitCrashLogPath();
+    EGJournalRotate();
+    EGJournal("paths-ok");
 #if ENABLE_CRASH_HANDLERS
     EGInstallCrashHandlers();
 #else
@@ -1327,9 +1600,11 @@ static void EGEnsureStarted(void) {
 #endif
     int guardCount = EGLaunchGuardCheck();
     if (guardCount != 0) gEGGuardTripped = YES;
+    EGJournal(gEGGuardTripped ? "guard-TRIPPED" : "guard-ok");
 
     EGStageSet("启动完成");
-    EGDiag(@"[启动] %@ %@ 已加载（bundle=%s）", @EG_TAG, @EG_VERSION, EG_BUNDLE_ID);
+    EGDiag(@"[启动] %@ %@ 已加载（变体=%s bundle=%s）",
+           @EG_TAG, @EG_VERSION, EG_VARIANT_TAG, EG_BUNDLE_ID);
 #if !ENABLE_CRASH_HANDLERS
     EGDiag(@"[启动] 信号处理器未装（ENABLE_CRASH_HANDLERS=0）—— 不覆盖宿主自己的");
 #endif
@@ -1348,22 +1623,28 @@ static void EGEnsureStarted(void) {
     if (gEGGuardTripped) {
         EGDiag(@"[自愈] 本次启动不装任何钩子 —— 只有悬浮球可用（长按可看崩溃回读）");
     } else {
+        // 开关关闭时这个函数自身就是"写日志说明被关掉"的实现，调用点不必再包 #if
         EGInstallViewDidAppearHook();
     }
 
 #if ENABLE_FLOAT_BUTTON
     EGInstallOverlay();
+    EGJournal(gEGButton ? "overlay-ok" : "overlay-FAILED");
+#else
+    EGJournal("overlay-skip");
 #endif
 
     // 启动后自动 dump 一次底栏 —— 用户没点按钮也能拿到数据
 #if ENABLE_AUTO_DUMP
     EGAfterOnMain(3.0, ^{
         EGStageSet("自动 dump 底栏 +3s");
+        EGJournal("dump+3s");
         EGDiag(@"[自动 dump·3s] 底栏取证：\n%@", EGTabBarForensics());
         EGDiag(@"[自动 dump·3s] 自绘底栏候选：\n%@", EGScanTabBarLikeClasses());
     });
     EGAfterOnMain(8.0, ^{
         EGStageSet("自动 dump 底栏 +8s");
+        EGJournal("dump+8s");
         EGDiag(@"[自动 dump·8s] 底栏取证：\n%@", EGTabBarForensics());
     });
 #endif
@@ -1371,14 +1652,33 @@ static void EGEnsureStarted(void) {
 #if ENABLE_CLASS_SCAN
     EGAfterOnMain(6.0, ^{
         EGStageSet("类名扫描");
+        EGJournal("class-scan");
         EGDiag(@"[类名扫描] 广告相关：\n%@", EGScanClassNames(EG_SCAN_KEYWORDS_AD, 60));
         EGDiag(@"[类名扫描] 「我的」页相关：\n%@", EGScanClassNames(EG_SCAN_KEYWORDS_MINE, 60));
     });
 #endif
 
+    EGJournal("timers-armed");
+
+#if EG_JOURNAL_MIRROR
+    // 上一次启动没走完 → 大概率崩过 → 把流水镜像到系统剪贴板。
+    // 这是崩溃后唯一不需要文件系统就能取证的通道：App 崩了悬浮球也没了，
+    // 而剪贴板跨进程存活，直接粘贴即可。
+    if (lastUnclean) {
+        NSString *jt = EGJournalTail(4000);
+        if (jt.length) {
+            EGSetClipboard([NSString stringWithFormat:
+                @"【%@ 上次启动未正常结束，以下是启动流水】\n%@", @EG_TAG, jt]);
+            EGDiag(@"[流水镜像] 上次启动未确认结束 → 已把流水写入剪贴板（%lu 字符）",
+                   (unsigned long)jt.length);
+        }
+    }
+#endif
+
     // 启动确认完成 -> 自愈计数归零
     EGAfterOnMain(12.0, ^{
         EGLaunchGuardClear();
+        EGJournal("confirmed");
         EGDiag(@"[自愈] 启动确认完成，计数已归零");
     });
 }
@@ -1422,13 +1722,60 @@ static void EGEnsureStarted(void) {
 //
 // 另：日志顺序改为"先 EGEnsureStarted，再由它自己初始化崩溃日志路径"，
 // 因为 EGInitCrashLogPath 要调 Foundation。
+//
+// ---------------------------------------------------------------------------
+// ★ v0.1.2：23:39:19 的**第二份** .ips —— v0.1.1 仍然崩，但形状完全不同
+// ---------------------------------------------------------------------------
+//   exception  EXC_BAD_ACCESS / SIGBUS，subtype UNKNOWN_0x101 at 0xf7
+//   启动→崩溃  0.48 秒（v0.1 那次是 0.18 秒）
+//   触发线程  thread 1 = **com.apple.root.default-qos**（全局并发队列），不是主线程
+//   帧        **只有 1 帧**：imageOffset=247、imageIndex=54
+//             —— 而 usedImages[54] 是全零条目（base=0 size=0 uuid=0000…），
+//             即 pc=0xf7 **不属于任何已加载镜像**
+//   寄存器    pc = lr = fp = **0xf7**（同一个值，且未对齐）
+//             x1 = SEL "release"
+//             x17 = -[__NSCFConstantString release]
+//             x2/x14/x15/x16 = __CFConstantStringClassReference
+//   另有 thread 2：dyld3::MachOLoaded::findClosestSymbol ← dyld4::APIs::dladdr
+//             ← JMCodeProtectKit ×3 ← _dispatch_call_block_and_release
+//             ← _dispatch_root_queue_drain
+//
+// 这份报告的判读（事实 / 推断分开写）：
+//   事实 1：崩溃线程是**全局并发队列**上的一条，而我们的代码**只跑主队列**。
+//   事实 2：崩溃线程只有一帧，且那一帧**落在任何镜像之外**（全零 image 条目）。
+//   事实 3：pc / lr / fp 三个寄存器是**同一个未对齐值 0xf7** —— 真实的指令地址不可能未对齐。
+//          正常的内存访问越界会给出一个**指向我们代码的、合法的 pc** 和一条可读的栈。
+//          三个寄存器同时被写成同一个垃圾值，说明**线程上下文本身是坏的**
+//          （内存被破坏，或被主动覆写），不是"简单的野指针解引用"。
+//   推断：第三方加固 SDK `JMCodeProtectKit` 在启动 0.48 秒时正在后台队列上走
+//          `dladdr` 遍历镜像列表做符号化 —— 这是一个**完整性校验 / 反注入扫描**的典型形状。
+//
+//   ★ 结论（这一条必须说清楚）：**没有任何证据表明这次崩溃由我们的代码引起。**
+//     但也没有证据**排除**"我们的镜像被加载"是触发条件 —— 两者是不同的问题。
+//     这正是 v0.1.2 做成四个变体台阶的原因：一次问完，不再一轮一轮猜。
+//     详见配置区「构建变体」那一节。
 %ctor {
-    dispatch_async(dispatch_get_main_queue(), ^{
 #if EG_MINIMAL_CTOR
-        // 最小验证模式（对照实验）：本次启动什么都不做 —— 见 EG_MINIMAL_CTOR 的说明
-        NSLog(@"[%@] minimal ctor —— 本次启动不做任何事", @EG_TAG);
+    // ===== 台阶 1「minimal」：完全空的构造函数 =====
+    // 连 NSLog 都不调 —— NSLog 本身会碰 CF/Foundation，那已经算"做了事"。
+    // 这一版只回答一个问题：**"我们的镜像被 dyld 加载"这件事本身**，
+    // 是否足以让宿主崩溃（反注入 / 完整性校验）。
+    // 判读：这一版还崩、而不注入 dylib 不崩 → 宿主在检测外来镜像。
+#else
+#if EG_JOURNAL_IN_CTOR
+    // 只有 dispatchonly 变体打开（见 EG_JOURNAL_IN_CTOR 的说明）。
+    // 纯 POSIX 三个 syscall，用来确认"我们的构造函数到底跑了没有"。
+    EGJournal("ctor");
+#endif
+    dispatch_async(dispatch_get_main_queue(), ^{
+#if EG_VARIANT_DISPATCHONLY
+        // ===== 台阶 2「dispatchonly」：%ctor 里只碰一次 libdispatch，块里什么都不做 =====
+        // 这一版只回答一个问题：**在 %ctor 里调用 dispatch_async 本身**是否安全
+        // （libdispatch 在 constructor 阶段的初始化顺序是个真实风险点）。
+        EGJournal("main-block");
 #else
         EGEnsureStarted();
 #endif
     });
+#endif
 }

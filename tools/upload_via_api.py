@@ -3,7 +3,15 @@
 为什么不用 git push：本机代理对 github.com:443 持续返回 502（CONNECT tunnel failed），
 而 api.github.com 可达。Git Data API 走的就是 api.github.com，绕开 git 传输层。
 
-流程：blobs -> tree -> commit -> ref（仓库为空，所以是 POST /git/refs 而非 PATCH）。
+流程：blobs -> tree -> commit -> ref（分支已存在则带 parent 再 PATCH）。
+
+用法：
+    python tools/upload_via_api.py                 # 用本地 HEAD 的提交信息
+    python tools/upload_via_api.py -m "自定义信息"
+
+★ 提交信息默认取 `git log -1 --pretty=%B`，不再硬编码。
+  硬编码的坑上次已经踩过：远程 commit 的信息与本地 commit 完全无关，
+  事后对不上"哪次改了什么"。
 """
 import base64
 import json
@@ -17,16 +25,21 @@ REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OWNER = "chowbing"
 REPO = "EGaosuTidy"
 BRANCH = "main"
-COMMIT_MSG = """chore(tools): 加 upload_via_api.py —— git push 被代理阻断时的备用提交通道
 
-本机沙箱代理对 github.com:443 持续返回 502（CONNECT tunnel failed），而 api.github.com
-可达（不同 host，代理对两者的状态可以完全相反）。此脚本用 Git Data API
-（blobs -> tree -> commit -> ref）直接提交，绕开 git 传输层。
 
-- 文件清单取自 `git ls-files`，保证上传的 tree 与本地 index 一致
-- 远程分支已存在时带 parent 再 force 更新，不丢已有历史
-- 用法：python tools/upload_via_api.py
-"""
+def commit_message():
+    """默认用本地 HEAD 的提交信息；-m/--message 可覆盖。"""
+    for flag in ("-m", "--message"):
+        if flag in sys.argv:
+            i = sys.argv.index(flag)
+            if i + 1 < len(sys.argv):
+                return sys.argv[i + 1]
+    p = subprocess.run(["git", "log", "-1", "--pretty=%B"],
+                       capture_output=True, text=True, cwd=REPO_DIR)
+    msg = (p.stdout or "").strip()
+    if not msg:
+        raise SystemExit("本地没有提交可同步（git log 返回空）—— 先 git commit")
+    return msg
 
 
 def get_token():
@@ -109,8 +122,10 @@ def main():
         print("远程 %s 已存在 -> parent = %s" % (BRANCH, parents[0][:10]))
 
     author = {"name": "Shawn", "email": "chowbing@users.noreply.github.com"}
+    msg = commit_message()
+    print("提交信息首行：%s" % msg.splitlines()[0])
     commit = api("POST", "/repos/%s/%s/git/commits" % (OWNER, REPO), {
-        "message": COMMIT_MSG,
+        "message": msg,
         "tree": tree["sha"],
         "parents": parents,
         "author": author,
