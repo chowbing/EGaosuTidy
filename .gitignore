@@ -5,5 +5,9 @@ packages/
 build.log
 *.dylib
 
+# CI artifact 下载的落点（本地核验用，不进仓库）
+dist/
+build-*.log
+
 # macOS
 .DS_Store

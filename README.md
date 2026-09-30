@@ -193,8 +193,18 @@ done
 ```
 
 GitHub Actions（`.github/workflows/build.yml`）在 `macos-latest` 上装 Theos + iPhoneOS SDK + ldid，
-**一轮编译出 4 个变体**，并逐个自证"变体标记字符串已嵌入产物"
-（防"构建成功但产物是上一个变体残留"这类静默错误）。
+**一轮编译出 4 个变体**，然后逐个自证产物正确：
+
+- **filetype 必须 = 6（MH_DYLIB）**。防的是"抓到 dSYM 调试符号文件"：
+  Theos 会跑 `dsymutil <dylib>`（不带 `-o`），生成
+  `.theos/obj/debug/arm64/EGaosuTidy.dylib.dSYM/Contents/Resources/DWARF/EGaosuTidy.dylib`
+  —— 这个文件**同名也叫 `EGaosuTidy.dylib`**（filetype=10 MH_DSYM，只有 `__DWARF` 段）。
+  用 `find .theos -name 'EGaosuTidy.dylib' | head -1` 取产物就会抓到它：构建"成功"、
+  产物大小看着也正常（139 KB），但注入到真机上什么都不会发生。**实测踩过。**
+  所以产物路径**写死**为 `.theos/obj/debug/EGaosuTidy.dylib`。
+- **变体标记字符串必须嵌入**（`strings | grep -qx "$V"`），防"产物是上一个变体的残留"。
+
+校验失败会让 job 变红 —— 一个"绿着但产物是坏的"构建比红色构建危险得多。
 
 **推送前必跑静态预检**（本机没有 macOS，每次推送都是一轮 CI，所以这步不能省）：
 

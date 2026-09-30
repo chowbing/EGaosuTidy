@@ -41,6 +41,13 @@ jobs:
       #   为什么这么做：每一版 = 一轮 CI + 一次真机注入，代价大；
       #   而"是不是我们的代码引起的"可以拆成**互不重叠的台阶**，一次全出更省时间。
       #   normal / nofloat / dispatchonly / minimal —— 判读规则见 Tweak.xm 配置区。
+      #
+      # ★★ 产物路径必须**写死**，绝对不能用 `find .theos -name 'EGaosuTidy.dylib' | head -1`：
+      #   Theos 会跑 `dsymutil <dylib>`（不带 -o），生成
+      #     .theos/obj/debug/arm64/EGaosuTidy.dylib.dSYM/Contents/Resources/DWARF/EGaosuTidy.dylib
+      #   —— 这个 **dSYM 里的文件同名也叫 EGaosuTidy.dylib**（filetype=10 MH_DSYM，只有 __DWARF 段）。
+      #   find 先钻进那个目录，head -1 就把它抓出来了：产物看着"成功"，其实是调试符号，
+      #   注入到真机上什么都不会发生。实测踩过（2026-09-30）。
       # ---------------------------------------------------------------------
       - name: Build all 4 variants
         continue-on-error: true
@@ -48,24 +55,28 @@ jobs:
           set +e
           mkdir -p dist
           for V in normal nofloat dispatchonly minimal; do
-            echo ""
-            echo "=================== variant = $V ==================="
             make clean >/dev/null 2>&1
             rm -rf .theos
-            make EG_VARIANT="$V" messages=yes 2>&1 | tee "build-$V.log"
-            RC=${PIPESTATUS[0]}
-            echo "[variant $V] make 退出码 = $RC"
-            DY=$(find .theos -name 'EGaosuTidy.dylib' 2>/dev/null | head -1)
-            if [ -n "$DY" ]; then
-              cp "$DY" "dist/EGaosuTidy-$V.dylib"
-              echo "[variant $V] OK -> dist/EGaosuTidy-$V.dylib  ($(stat -f%z "$DY") bytes)"
-            else
-              echo "[variant $V] !! 没有产出 dylib"
-            fi
+            make EG_VARIANT="$V" messages=yes > "build-$V.log" 2>&1
+            RC=$?
+            OUT=".theos/obj/debug/EGaosuTidy.dylib"
+            [ -f "$OUT" ] || OUT=".theos/obj/EGaosuTidy.dylib"
+            {
+              echo ""
+              echo "=================== variant = $V ==================="
+              echo "[variant $V] make 退出码 = $RC"
+              if [ -f "$OUT" ]; then
+                cp "$OUT" "dist/EGaosuTidy-$V.dylib"
+                echo "[variant $V] 产物 = $OUT  ($(stat -f%z "$OUT") bytes)"
+              else
+                echo "[variant $V] !! 预期路径不存在，列出 .theos 下所有匹配："
+                find .theos -name 'EGaosuTidy*' 2>/dev/null
+              fi
+            } | tee -a "build-$V.log"
           done
           echo ""
           echo "---- dist ----"
-          ls -la dist || true
+          ls -la dist
 
       - name: Show hard errors (all variants)
         if: always()
@@ -79,20 +90,44 @@ jobs:
             fi
           done
 
-      # 自证：每个 dylib 里都应嵌着对应变体的标记字符串（EG_VARIANT_TAG）。
-      # 这一条防的是"构建成功、但产物其实是上一个变体的残留"这类静默错误。
-      - name: Verify variant tag embedded in each dylib
+      # 自证：产物必须是**真的 dylib**（filetype=6 MH_DYLIB），且嵌着本变体的标记字符串。
+      # 两道检查各防一类静默错误：
+      #   filetype 防"抓到 dSYM 调试符号文件"（见上面那段说明）
+      #   标记字符串防"产物是上一个变体的残留"
+      # 校验失败**要让 job 变红** —— 一个"绿着但产物是坏的"构建比红色构建危险得多。
+      - name: Verify artifacts are real dylibs and carry the right variant tag
         if: always()
         run: |
+          mkdir -p dist
+          : > dist/verify.txt
           for V in normal nofloat dispatchonly minimal; do
             F="dist/EGaosuTidy-$V.dylib"
-            if [ ! -f "$F" ]; then echo "[$V] 缺产物"; continue; fi
-            if strings "$F" | grep -qx "$V"; then
-              echo "[$V] 标记字符串已嵌入"
+            if [ ! -f "$F" ]; then
+              echo "[$V] FAILED 缺产物" >> dist/verify.txt
+              continue
+            fi
+            SZ=$(stat -f%z "$F")
+            FT=$(od -An -tu4 -j12 -N4 "$F" | tr -d ' \n')
+            if [ "$FT" = "6" ]; then
+              echo "[$V] OK   filetype=6 MH_DYLIB   ${SZ} bytes" >> dist/verify.txt
+            elif [ "$FT" = "10" ]; then
+              echo "[$V] FAILED filetype=10 MH_DSYM —— 抓到的是调试符号文件，不是 dylib！" >> dist/verify.txt
             else
-              echo "[$V] 找不到标记字符串 —— 产物可能是别的变体"
+              echo "[$V] FAILED filetype=$FT 意外（6=MH_DYLIB, 10=MH_DSYM）" >> dist/verify.txt
+            fi
+            file "$F" >> dist/verify.txt 2>&1
+            if strings "$F" | grep -qx "$V"; then
+              echo "[$V] OK   变体标记 \"$V\" 已嵌入" >> dist/verify.txt
+            else
+              echo "[$V] FAILED 找不到变体标记 \"$V\" —— 产物可能串档" >> dist/verify.txt
             fi
           done
+          cat dist/verify.txt
+          if grep -q "FAILED" dist/verify.txt; then
+            echo ">>> 产物校验未通过"
+            exit 1
+          fi
+          echo ">>> 产物校验通过"
 
       - name: Upload build logs
         if: always()   # 不论成败都上传日志
@@ -104,6 +139,7 @@ jobs:
             build-nofloat.log
             build-dispatchonly.log
             build-minimal.log
+            dist/verify.txt
 
       - name: Upload dylibs (4 variants)
         if: always()
