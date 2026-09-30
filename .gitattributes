@@ -1,0 +1,7 @@
+# 统一换行符：Windows 本地 + macOS CI 混合环境，CRLF 会让 Theos/Makefile 与 .py 出现意外差异
+* text=auto eol=lf
+
+# 二进制
+*.dylib binary
+*.png binary
+*.jpg binary
