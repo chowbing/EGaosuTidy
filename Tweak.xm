@@ -128,6 +128,14 @@
 // 启动自愈：同一构建连续 N 次启动异常 → 本次启动不装任何钩子
 #define EG_LAUNCH_GUARD_MAX      3
 
+// ★ 最小验证模式：打开后 %ctor 里连 EGEnsureStarted 都不调，什么都不做。
+//   用途：如果 v0.1.1 仍然闪退，用这一版做**对照实验** ——
+//     · 最小模式**不崩** → 问题在我们的代码，继续往下查；
+//     · 最小模式**照崩** → 问题在"注入行为本身被宿主检测"（反注入 / 完整性校验），
+//       %ctor 再怎么减也没用，要换注入方式或另想办法。
+//   默认 0。
+#define EG_MINIMAL_CTOR          0
+
 // 类名扫描关键词（只用来**报告**，不用来改行为）
 #define EG_SCAN_KEYWORDS_TAB   @[@"TabBar", @"Tabbar", @"TabItem", @"TabButton", @"TabView", @"TabController", @"BottomBar", @"MainTab"]
 #define EG_SCAN_KEYWORDS_AD    @[@"Banner", @"Advert", @"AdView", @"Promot", @"Popup", @"Splash", @"Market", @"Operat"]
@@ -1416,6 +1424,11 @@ static void EGEnsureStarted(void) {
 // 因为 EGInitCrashLogPath 要调 Foundation。
 %ctor {
     dispatch_async(dispatch_get_main_queue(), ^{
+#if EG_MINIMAL_CTOR
+        // 最小验证模式（对照实验）：本次启动什么都不做 —— 见 EG_MINIMAL_CTOR 的说明
+        NSLog(@"[%@] minimal ctor —— 本次启动不做任何事", @EG_TAG);
+#else
         EGEnsureStarted();
+#endif
     });
 }

@@ -146,10 +146,15 @@ EGaosuTidy/
 ## 6. 安全底线（探针阶段）
 
 - **探针不改任何东西**：不隐藏、不删除、不改约束、不拦弹窗、不动数据。产出只有文本。
-- `%ctor` 只做三件事：算崩溃日志路径、装崩溃处理器、把其余全部 `dispatch_async` 到主队列。
-  **诊断钩子绝不放在启动路径上** —— 一次"在 dyld 阶段全进程扫类"曾把同类项目的目标 App
-  打到**完全打不开**（且 `@try/@catch` 救不了：异常在 `dispatch_once` 里被 libdispatch 边界
-  吞成 `std::terminate`）。
+- **`%ctor` 只做一件事：一次 `dispatch_async`。** 其余全部（崩溃日志路径、文件 IO、信号处理器、
+  钩子）都放进那个块里，等主队列执行。
+  **`%ctor` 运行在 dyld 的 `runAllInitializersForMain → runInitializersBottomUp → notifyObjCInit
+  → load_images` 之中** —— 也就是说，**它跑在宿主自己的初始化过程里**，此时宿主的 `+load`
+  可能还在执行。在那里做的任何有副作用的事，都发生在别人的地基上。
+  v0.1 就是在这里翻了车（见顶部），实测证据是一份 0.18 秒的 SIGBUS `.ips`。
+- **默认不装信号处理器**（`ENABLE_CRASH_HANDLERS 0`）。覆盖宿主自己的 `sigaction` 会把它的
+  "自检"变成"真崩溃"。失去的只是爆栈类崩溃的现场取证，而系统 `.ips` 同样完整 ——
+  本次这个崩溃正是靠 `.ips` 定位的。
 - 查方法一律 `class_copyMethodList` 手走父类链，**绝不用 `class_getInstanceMethod`**
   —— 后者会强制 `+initialize`。
 - 只 hook **一个类的一个 selector**（`UIViewController.viewDidAppear:`），一个 shim + 一个全局
