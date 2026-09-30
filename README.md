@@ -266,17 +266,32 @@ EGaosuTidy/
 ├── Tweak.xm                    探针本体（唯一需要读的源文件）
 ├── Makefile                    含 4 变体机制 + GO_EASY_ON_ME
 ├── control / *.plist           Theos 工程配置
-├── tools/                      推送前静态预检（从既有项目复用，通用）
+├── tools/                      工具（静态预检 + 崩溃分析 + 产物核验）
 │   ├── preflight.py            一次跑完全部检查，并先自证检查器没瞎
 │   ├── chk.py                  括号/引号平衡（tokeniser-aware）
 │   ├── audit.py                调用早于定义 / 全局引用早于定义 / 递归 block 缺 __block
 │   ├── strchk.py               字符串字面量未闭合
 │   ├── objcpp.py               ObjC 合法但 ObjC++ 是硬 error 的构造
 │   ├── ips.py                  iOS 15+ .ips 崩溃报告解析（两个 JSON 文档拼在一个文件里）
-│   └── ipsdiff.py              两份 .ips 的结构化对比（崩溃帧归属 / 保护类 SDK / 镜像差异）
-├── docs/                       崩溃现场留档
+│   ├── ipsdiff.py              两份 .ips 的结构化对比（崩溃帧归属 / 保护类 SDK / 镜像差异）
+│   ├── fetch_artifacts.py      取最新 CI 产物并**本地独立核验**（filetype + 变体标记）
+│   └── upload_via_api.py       git push 被代理阻断时的备用提交通道
 └── .github/workflows/build.yml CI：一轮出 4 个变体
 ```
+
+**取产物别去网页点，用 `tools/fetch_artifacts.py`**：
+
+```bash
+python tools/fetch_artifacts.py       # 最新一次 run
+python tools/fetch_artifacts.py 6     # 指定 run 序号
+```
+
+它会下载产物、**在本地独立核验**（Mach-O filetype 必须是 6=MH_DYLIB、变体标记必须嵌入、
+打印各段大小），然后把 4 个 dylib 解到 `dist/`。核验不过返回非零退出码。
+
+> 为什么不能只信 CI 自己的报告：本项目实测踩过一次 —— CI 报 success，
+> 产物大小看着也正常，实际抓到的却是 dSYM 里的调试符号文件（filetype=10），
+> 注入真机后什么都不会发生。**核验必须在下载之后独立做。**
 
 ---
 
