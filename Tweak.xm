@@ -1741,7 +1741,10 @@ static void EGApplyMineAdRule(UIView *root, const char *reason) {
                         if ([p isKindOfClass:[UITableViewCell class]]) break;
                         p = p.superview;
                     }
-                    if (p) zcCells[p] = @"ZCycle";   // 弱键 map，天然去重
+                    // ★ NSMapTable **不支持**下标写法（zcCells[p] = ... 编译不过：
+                    //   "expected method to write dictionary element not found"）。
+                    //   必须走 setObject:forKey:。弱键 map，天然去重。
+                    if (p) [zcCells setObject:@"ZCycle" forKey:p];
                 }
             }
 #endif
@@ -1749,7 +1752,11 @@ static void EGApplyMineAdRule(UIView *root, const char *reason) {
         }
 
         // 副判据收集到的容器，统一塌陷（放在遍历后 —— 避免在遍历中改 frame）
-        for (UIView *p in zcCells) {
+        // 用 keyEnumerator 而不是 for-in：NSMapTable 的快速枚举语义不如 NSArray 直观，
+        // 明确枚举 key 更不容易出错。
+        NSEnumerator *keys = [zcCells keyEnumerator];
+        UIView *p = nil;
+        while ((p = [keys nextObject])) {
             if (EGCollapseAdCell(p, "ZCycle", &reg)) { n++; zc++; }
         }
 

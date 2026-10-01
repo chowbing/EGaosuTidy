@@ -4,7 +4,7 @@
 抓不到"在 Objective-C 里合法、在 Objective-C++ 里是硬 error"的那一类。这类错每次都要烧掉
 一轮 CI（2026-09-24 就因此挂了一次）。
 
-目前覆盖四类已实际踩过的坑：
+目前覆盖五类已实际踩过的坑：
   A. 函数指针 ↔ void* 的隐式转换
      `[NSValue valueWithPointer:orig]` 其中 orig 是 IMP → C++ 不允许函数指针隐式转 const void*。
   B. `getResourceValue:&x` 这类 out id* 参数（ARC 下走 pass-by-writeback，ObjC++ 更容易踩）。
@@ -12,8 +12,12 @@
   D. `volatile const char *` 传进**有类型**的形参（如 `stringWithUTF8String:`）：
      丢掉 volatile 限定符在 C++ 里是 ill-formed。传进 `...` 可变参数（%s）反而没事 ——
      所以这个坑只在"有类型形参"处爆，很隐蔽。
+  E. 对 **NSMapTable** 用下标语法（`map[key] = v` / `map[key]`）。
+     NSMapTable 不实现 objectForKeyedSubscript: / setObject:forKeyedSubscript:，
+     clang 报 "expected method to write dictionary element not found on object of
+     type 'NSMapTable *'"。2026-10-01 在 CI 上挂过一次（本轮白烧一轮构建）。
 
-用法：python objcpp.py [Tweak.xm]    A/B/D 类有问题时退出码 1；C 类仅提示。
+用法：python objcpp.py [Tweak.xm]    A/B/D/E 类有问题时退出码 1；C 类仅提示。
 """
 import os
 import re
@@ -51,12 +55,16 @@ def main():
     funcptr_vars = set()
     # D. 收集声明为 volatile 的变量名（任何类型；重点是指针）
     volatile_vars = set()
+    # E. 收集声明为 NSMapTable * 的变量名
+    maptable_vars = set()
     for L in lines:
         code = strip_noise(L)
         for m in re.finditer(r'\bIMP\s+(\w+)\s*[=;]', code):
             funcptr_vars.add(m.group(1))
         for m in re.finditer(r'\bvolatile\b[^=;()]*?\b(\w+)\s*(?:=[^;]*)?;', code):
             volatile_vars.add(m.group(1))
+        for m in re.finditer(r'\bNSMapTable\s*\*\s*(\w+)', code):
+            maptable_vars.add(m.group(1))
 
     problems = []
     notes = []
@@ -93,6 +101,14 @@ def main():
                                      '%s 的形参是 const char*，传 volatile 指针在 C++ 里是硬 error；'
                                      '改用 WFStageText() 这类收口函数，或显式 (const char *)%s'
                                      % (api, name)))
+
+        # E. NSMapTable 下标语法 —— NSMapTable 没有下标存取方法，硬 error
+        for name in maptable_vars:
+            if re.search(r'\b' + re.escape(name) + r'\s*\[', code):
+                problems.append((i, 'E NSMapTable 下标', s,
+                                 'NSMapTable 不支持下标语法；写入改为 '
+                                 '[%s setObject:v forKey:k]，读取改为 [%s objectForKey:k]'
+                                 % (name, name)))
 
         # C. 三元里混 nil / Nil（仅提示）
         if re.search(r'\?[^?;]*:\s*(?:nil|Nil)\b', code):
