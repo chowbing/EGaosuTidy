@@ -113,7 +113,7 @@
 // ============================== 配置 ==============================
 
 #define EG_TAG              "EGaosuTidy"
-#define EG_VERSION          "0.1.2-probe"
+#define EG_VERSION          "0.2.0-rules"
 // ★ bundle id：真机 .ips 实测（2026-09-30 23:21:29）是 com.sdhsie.westeros.weirwood。
 //   之前写的 com.sdhs.easy.high.road 是从三个 Android 商店包名**推断**的 —— 推断错了。
 //   iOS 与 Android 的 bundle id 不保证一致，这条只能靠实测。
@@ -343,6 +343,18 @@ static NSString *EGScanTabBarLikeClasses(void);
 
 static BOOL EGClassNameMatchesAny(NSString *n, NSArray<NSString *> *kws);
 static NSString *EGScanClassNames(NSArray<NSString *> *keywords, NSUInteger maxOut);
+
+// v0.2 规则引擎（前向声明）
+static BOOL EGIsMineTabVC(UIViewController *vc);
+static void EGApplyTabBarRule(UITabBarController *tbc, const char *reason);
+static void EGApplyMineAdRule(UIView *root, const char *reason);
+static void EGApplyAllRules(UITabBarController *tbc, const char *reason);
+static void EGInstallHeightHook(void);
+static void EGInstallRulesHooks(void);
+static void EGWatchMinePage(void);
+static NSArray *EGFindTabBarControllers(void);
+static UITableView *EGEnclosingTableView(UIView *v, NSIndexPath **outIP);
+static BOOL EGIsAdRowRegistered(UITableView *tv, NSIndexPath *ip);
 
 static void EGSetClipboard(NSString *text);
 static void EGFlashButton(NSString *text);
@@ -1238,6 +1250,476 @@ static NSString *EGScanClassNames(NSArray<NSString *> *keywords, NSUInteger maxO
     return [head stringByAppendingString:s];
 }
 
+// ============================================================================
+// ★★★ v0.2 规则引擎 —— 从"只取证"转为"真改界面"
+// ============================================================================
+//
+// 全部规则**只依赖 2026-10-01 两次真机抓取实测到的字段**，没有一个字是猜的：
+//
+//   [实测] RootTabBarController : UITabBarController（原生，非自绘）
+//   [实测] viewControllers[0..4] 全部是 e高速.RootNavigationController
+//   [实测] 真身在各 RootNavigationController 的 topViewController 类名上：
+//            [0] FunctionMenuHomePageViewController   首页
+//            [1] TheOwnerServiceMainViewController    车主服务
+//            [2] ETCMemberMainViewController          会员服务
+//            [3] MallMainContorller                   商城
+//            [4] MyInfoViewControllerNew              我的
+//   [实测] tabBarItem.tag **全部为 0** -> tag 不可用作识别键
+//   [实测] tabBarItem.title 分别是 首页/车主服务/会员服务/商城/我的
+//   [实测] 「我的」页广告 = e高速.MyInfoViewControllerBannerCell（原生 cell）
+//            位于 MyInfoViewControllerNew 的 UITableView，frame.y=275 高 79
+//            内部 ZCycleView -> UICollectionView -> ZCycleViewCell（非 H5）
+//   [实测] 同一 UITableView 里有 **4 个 hidden=YES 且高度为 0 的 MyInfoTitleCell 残影**
+//            （cell 复用池里的游离实例）-> 不能按类名盲删，必须判 hidden/尺寸
+//
+// 设计要点（每条都对应一次真实翻车的可能性）：
+//   ① **不删 viewControllers，只重建数组。** 直接 removeObjectAtIndex: 会让
+//      NavigationController 与其持有的 VC 引用计数关系变化；重建数组最干净。
+//   ② **保留的对象直接引用原实例**，不新建 —— 新建会丢掉已加载的状态。
+//   ③ **幂等**。userDefaults 不用；每次调用重新算一遍，已经是 1 个就跳过。
+//      不依赖"哪一次时机是对的"这个假设（viewDidLoad / viewWillAppear 都挂）。
+//   ④ **只改 UITabBarController 这一个类的 viewDidLoad/viewWillAppear:**，
+//      单类单 selector 单 shim，不装通用安装器（见 hook 一节的理由）。
+//   ⑤ 广告位：**"不显示"和"不占位"是两件事**。hide cell 只做了前者，
+//      高度必须一起改，否则留 79pt 空白。
+// ============================================================================
+
+#define EG_ENABLE_RULES        1   // 总开关：关掉即退回纯探针
+#define EG_RULE_KEEP_TOP_VC    "MyInfoViewControllerNew"   // 唯一保留的 tab（按 topViewController 类名匹配）
+
+// 广告 cell 类名（实测于「我的」页）
+#define EG_RULE_AD_CELL_CLASS  "MyInfoViewControllerBannerCell"
+#define EG_RULE_MINE_TABLE_VC  "MyInfoViewControllerNew"
+
+static BOOL gEGRulesInstalled    = NO;
+static BOOL gEGTabBarNarrowed    = NO;
+static NSUInteger gEGTabBarCutCount = 0;
+static NSUInteger gEGAdCellHiddenCount = 0;
+
+// ---- 识别：这个 viewController 是不是"我的" ----
+// 匹配顺序刻意从最可靠到最不可靠：
+//   1. topViewController 类名（实测唯一可靠 —— tag 全 0、title 可能被本地化）
+//   2. tabBarItem.title == "我的"（实测可用，作为二次确认）
+static BOOL EGIsMineTabVC(UIViewController *vc) {
+    if (!vc) return NO;
+    @try {
+        // 1) 剥掉 NavigationController 取真身
+        UIViewController *top = vc;
+        if ([vc isKindOfClass:[UINavigationController class]]) {
+            top = [(UINavigationController *)vc topViewController];
+        }
+        if (top) {
+            const char *cn = class_getName([top class]);
+            if (cn && strcmp(cn, EG_RULE_KEEP_TOP_VC) == 0) return YES;
+        }
+        // 2) title 兜底
+        NSString *t = vc.tabBarItem.title;
+        if (t.length && [t isEqualToString:@"我的"]) return YES;
+    } @catch (NSException *e) {}
+    return NO;
+}
+
+// ---- 规则 1：底栏只留「我的」 ----
+static void EGApplyTabBarRule(UITabBarController *tbc, const char *reason) {
+#if EG_ENABLE_RULES
+    if (!tbc) return;
+    if (![tbc isKindOfClass:[UITabBarController class]]) return;
+    // 只用实测到的那个类：别人的 UITabBarController（若 App 里还有别的）不动
+    const char *cn = class_getName([tbc class]);
+    if (!cn || strcmp(cn, "RootTabBarController") != 0) return;
+
+    @try {
+        NSArray *vcs = tbc.viewControllers;
+        if (!vcs || vcs.count <= 1) {   // 已经是 1 个 -> 幂等，直接记状态
+            gEGTabBarNarrowed = (vcs.count == 1);
+            return;
+        }
+
+        NSMutableArray *keep = [NSMutableArray array];
+        NSMutableArray *drop = [NSMutableArray array];
+        for (UIViewController *vc in vcs) {
+            if (EGIsMineTabVC(vc)) [keep addObject:vc];
+            else                    [drop addObject:vc];
+        }
+
+        if (keep.count == 0) {
+            // **一条都没匹配上就什么都不做** —— 宁可不动，也不要把底栏清空。
+            // 这是硬底线：识别失败时"不动"永远优于"乱动"。
+            EGDiag(@"[规则·底栏] (%s) 5 个 tab 里没识别出「我的」-> **放弃，不动**（保护性退出）",
+                   reason);
+            return;
+        }
+        if (drop.count == 0) {   // 本来就只有「我的」
+            gEGTabBarNarrowed = YES;
+            return;
+        }
+
+        NSMutableString *dropped = [NSMutableString string];
+        for (UIViewController *vc in drop) {
+            UIViewController *top = vc;
+            if ([vc isKindOfClass:[UINavigationController class]])
+                top = [(UINavigationController *)vc topViewController];
+            [dropped appendFormat:@"%@ ", top ? NSStringFromClass([top class]) : @"?"];
+        }
+
+        // ★ 重建数组而不是 removeObjectAtIndex: —— 保留的对象仍是**原实例**
+        tbc.viewControllers = [keep copy];
+        tbc.selectedIndex = 0;
+        gEGTabBarCutCount += drop.count;
+        gEGTabBarNarrowed = YES;
+
+        EGDiag(@"[规则·底栏] (%s) 5 -> %lu，移除: %@（保留 %@）",
+               reason, (unsigned long)keep.count, dropped,
+               keep.count ? NSStringFromClass([[keep firstObject] class]) : @"?");
+        EGJournal("rule-tabbar-ok");
+    } @catch (NSException *e) {
+        EGDiag(@"[规则·底栏] 异常: %@", e.reason);
+        EGJournal("rule-tabbar-EXC");
+    }
+#endif
+}
+
+// ---- 规则 3：广告行高 = 0（覆盖还没实例化的那一次） ----
+//
+// 为什么必须有这条：UITableView 只实例化**可见区域**的 cell。
+// 广告行若在屏幕外，规则 2 的视图树遍历根本看不到它 —— 用户一滚就冒出来了。
+// 必须从 dataSource 层面把高度压成 0，与"是否已实例化"无关。
+//
+// ★ 判据怎么来（这里是关键，也是我上一版写错的地方）：
+//   不能靠"猜某个 indexPath 是广告行"。要**从行为上观察**：
+//   `heightForRowAtIndexPath:` 被调用时，只有高度**不够可靠地区分身份**。
+//   可靠的做法是**先观察谁被实例化了**：hook 只装在 `MyInfoViewControllerNew`，
+//   当 tableView 要显示某一行时，我们自己问 dataSource 要 cell 是**有副作用**的
+//   （会触发 cellForRow 并可能引起递归），所以不走那条路。
+//
+//   最终方案 —— **登记制**：
+//     在 `EGApplyMineAdRule` 的视图树遍历里，凡命中广告类名的 cell，
+//     把它所在的 tableView + indexPath 记进 `gEGAdRows`。
+//     行高 hook 只查登记表。表格滚动时，新行会先走 heightForRow 再创建 cell，
+//     首次可能漏一次；但 `EGWatchMinePage` 的周期巡检会补上登记
+//     （cell 一旦实例化就被并入登记表，下一轮布局即塌陷）。
+//
+//   这比"猜"稳健：**判据来自真实观察，且有两个独立通道互相兜底**
+//   （视图树遍历 + 周期巡检），任一通道生效即可。
+static NSMutableSet<NSString *> *gEGAdRowKeys = nil;   // key = "<tableView 指针>#<section>.<row>"
+
+static NSString *EGAdRowKey(UITableView *tv, NSIndexPath *ip) {
+    if (!tv || !ip) return nil;
+    return [NSString stringWithFormat:@"%p#%ld.%ld", (void *)tv,
+            (long)ip.section, (long)ip.row];
+}
+
+static BOOL EGIsAdRowRegistered(UITableView *tv, NSIndexPath *ip) {
+    NSString *k = EGAdRowKey(tv, ip);
+    if (!k) return NO;
+    @synchronized (@"EGAdRows") {
+        return gEGAdRowKeys && [gEGAdRowKeys containsObject:k];
+    }
+}
+
+static IMP  gEGOrigHeightForRow    = NULL;
+static BOOL gEGHeightHookInstalled = NO;
+
+static CGFloat EGHeightForRowHook(id self, SEL _cmd, UITableView *tv, NSIndexPath *ip) {
+    CGFloat h = 0;
+    IMP orig = gEGOrigHeightForRow;
+    if (orig) {
+        @try {
+            h = ((CGFloat (*)(id, SEL, UITableView *, NSIndexPath *))orig)(self, _cmd, tv, ip);
+        } @catch (NSException *e) {
+            EGDiag(@"[规则·行高] 原实现抛异常: %@", e.reason);
+            return h;
+        }
+    }
+    @try {
+        if (EGIsAdRowRegistered(tv, ip)) {
+            if (h > 0.5) {
+                EGDiag(@"[规则·行高] %@ -> 0（原 %.0f，已登记为广告行）", ip, (double)h);
+            }
+            h = 0;
+        }
+    } @catch (NSException *e) {}
+    return h;
+}
+
+// 装行高钩子。**只在 `MyInfoViewControllerNew` 自己实现了 heightForRowAtIndexPath:
+// 时才装** —— 若它没实现（继承 UITableView 的），换父类 IMP 会波及全 App 的表格。
+// 这是硬约束，不是优化。
+static void EGInstallHeightHook(void) {
+    if (gEGHeightHookInstalled) return;
+    Class c = objc_getClass(EG_RULE_MINE_TABLE_VC);
+    if (!c) {
+        EGDiag(@"[规则·行高] 找不到类 %s —— 不装（不猜父类）", EG_RULE_MINE_TABLE_VC);
+        return;
+    }
+    SEL sel = @selector(tableView:heightForRowAtIndexPath:);
+    Method own = EGOwnMethod(c, sel);          // 只认**自己**实现的那份
+    if (!own) {
+        EGDiag(@"[规则·行高] %s 没有自己的 %@ —— 不装钩子（避免波及全 App 的 tableView）",
+               EG_RULE_MINE_TABLE_VC, NSStringFromSelector(sel));
+        return;
+    }
+    IMP cur = method_getImplementation(own);
+    if (cur == (IMP)EGHeightForRowHook) { gEGHeightHookInstalled = YES; return; }
+    gEGOrigHeightForRow = method_setImplementation(own, (IMP)EGHeightForRowHook);
+    gEGHeightHookInstalled = YES;
+    EGDiag(@"[规则·行高] 已装 %s -%@（orig=%p）",
+           EG_RULE_MINE_TABLE_VC, NSStringFromSelector(sel), (void *)gEGOrigHeightForRow);
+}
+
+// 从任意 view 向上找它所在的 UITableView（含 indexPath 反查）
+static UITableView *EGEnclosingTableView(UIView *v, NSIndexPath **outIP) {
+    if (outIP) *outIP = nil;
+    UIView *cur = v;
+    NSUInteger guard = 0;
+    while (cur && guard++ < 64) {
+        if ([cur isKindOfClass:[UITableView class]]) {
+            UITableView *tv = (UITableView *)cur;
+            if (outIP) {
+                @try {
+                    NSIndexPath *ip = [tv indexPathForCell:(UITableViewCell *)v];
+                    if (!ip) {
+                        // cell 可能有一层容器包着；逐级往上试
+                        UIView *p = v.superview;
+                        NSUInteger g2 = 0;
+                        while (p && p != tv && g2++ < 8) {
+                            if ([p isKindOfClass:[UITableViewCell class]]) {
+                                ip = [tv indexPathForCell:(UITableViewCell *)p];
+                                if (ip) break;
+                            }
+                            p = p.superview;
+                        }
+                    }
+                    *outIP = ip;
+                } @catch (NSException *e) {}
+            }
+            return tv;
+        }
+        cur = cur.superview;
+    }
+    return nil;
+}
+
+// ---- 规则 2：「我的」页广告位 隐藏 + 塌陷（并登记行号供规则 3 使用） ----
+// 遍历整棵视图树：
+//   · 命中广告类名的 cell -> hidden + 高度清零（"不显示"和"不占位"一起做）
+//   · 顺手把它所在的 tableView + indexPath 登记进 gEGAdRowKeys，
+//     让**尚未实例化**的同款行也能被规则 3 压成 0 高
+static void EGApplyMineAdRule(UIView *root, const char *reason) {
+#if EG_ENABLE_RULES
+    if (!root) return;
+    NSUInteger n = 0, reg = 0;
+    @try {
+        NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
+        NSUInteger guard = 0;
+        while (stack.count && guard++ < 20000) {
+            UIView *v = [stack lastObject];
+            [stack removeLastObject];
+
+            const char *cn = class_getName([v class]);
+            if (cn && strcmp(cn, EG_RULE_AD_CELL_CLASS) == 0) {
+                CGFloat origH = v.frame.size.height;
+                BOOL origHidden = v.hidden;
+
+                // 登记行号（供规则 3）—— 独立于"是否已隐藏"，
+                // 这样即使本轮因复用已被隐藏过，行号也不会漏登记
+                NSIndexPath *ip = nil;
+                UITableView *tv = EGEnclosingTableView(v, &ip);
+                if (tv && ip) {
+                    NSString *k = EGAdRowKey(tv, ip);
+                    @synchronized (@"EGAdRows") {
+                        if (!gEGAdRowKeys) gEGAdRowKeys = [NSMutableSet set];
+                        if (k && ![gEGAdRowKeys containsObject:k]) {
+                            [gEGAdRowKeys addObject:k];
+                            reg++;
+                        }
+                    }
+                }
+
+                // 幂等：已经隐藏且高度为 0 就不再动
+                if (!origHidden || origH > 0.5) {
+                    v.hidden = YES;
+                    CGRect f = v.frame;
+                    f.size.height = 0;
+                    v.frame = f;
+                    n++;
+                    EGDiag(@"[规则·广告] 隐藏并塌陷 %@  frame=(%.0f,%.0f,%.0f,%.0f) -> h=0  行=%@",
+                           NSStringFromClass([v class]),
+                           f.origin.x, f.origin.y, f.size.width, origH,
+                           ip ? [NSString stringWithFormat:@"%ld.%ld", (long)ip.section, (long)ip.row] : @"(未定位)");
+                }
+            }
+            for (UIView *sub in v.subviews) [stack addObject:sub];
+        }
+        if (n || reg) {
+            gEGAdCellHiddenCount += n;
+            EGJournal("rule-ad-ok");
+            EGDiag(@"[规则·广告] (%s) 本轮塌陷 %lu 个，新登记行号 %lu 个（累计登记 %lu）",
+                   reason, (unsigned long)n, (unsigned long)reg,
+                   (unsigned long)(gEGAdRowKeys ? gEGAdRowKeys.count : 0));
+        }
+    } @catch (NSException *e) {
+        EGDiag(@"[规则·广告] 异常: %@", e.reason);
+    }
+#endif
+}
+
+// ---- 规则总入口：对一个 tabBarController 把三条规则跑一遍（幂等） ----
+static void EGApplyAllRules(UITabBarController *tbc, const char *reason) {
+#if EG_ENABLE_RULES
+    EGApplyTabBarRule(tbc, reason);
+
+    // 广告规则只在进入「我的」页时才跑（其他页没有这个 cell，跑了也是空转）
+    UIViewController *sel = nil;
+    @try { sel = tbc.selectedViewController; } @catch (NSException *e) {}
+    if (!sel) return;
+    const char *cn = class_getName([sel class]);
+    if (!cn || strcmp(cn, "RootNavigationController") != 0) return;
+
+    UIViewController *top = nil;
+    @try { top = [(UINavigationController *)sel topViewController]; } @catch (NSException *e) {}
+    if (!top || strcmp(class_getName([top class]), EG_RULE_MINE_TABLE_VC) != 0) return;
+
+    if (gEGGuardTripped) return;
+    EGApplyMineAdRule(top.view, reason);
+#endif
+}
+
+// ============================================================================
+// 规则钩子安装 —— 单类单 selector 单 shim，与 viewDidAppear 那套同一纪律
+// ============================================================================
+//
+// hook 两个类，各两个（或一个）selector：
+//   RootTabBarController : viewDidLoad / viewWillAppear:
+//        —— 两个时机都挂，因为**构造时机未知**：
+//           实测只能证明"运行时它有 5 个"，不能证明"什么时候变成 5 个"。
+//           两个都挂 + 幂等 = 不依赖时序假设。（这是 2026-10-01 抓取后确定的做法）
+//   MyInfoViewControllerNew : viewWillAppear:（另外还有 heightForRow，见规则 3）
+//        —— 「我的」页每次出现都巡检一次广告位（cell 复用会重新显示）
+//
+// ★ 为什么 viewWillAppear: 要装在**每个具体类自己**的实现上，而不是 UIViewController：
+//   viewWillAppear: 是"每个子类各写各的"的方法，不存在一个父类实现能覆盖全部。
+//   装 3 个具体类 = 3 个 shim，各自独立；这与"装一个 UIViewController.viewDidAppear:"
+//   完全不同 —— 后者是父类单点、子类调 super 会回到同一个 shim，才有递归风险。
+//   这里每个类只挂自己那一份，调用链是 [self viewWillAppear:] -> 我们 -> 原 IMP，
+//   我们的原 IMP 指向该类的**上一级**实现，不存在回到自己的路径。
+
+static IMP  gEGOrigRootTBCViewDidLoad    = NULL;
+static IMP  gEGOrigRootTBCViewWillAppear = NULL;
+static IMP  gEGOrigMineViewWillAppear    = NULL;
+static BOOL gEGRulesHooksInstalled       = NO;
+
+static void EGRootTBCViewDidLoadHook(id self, SEL _cmd) {
+    IMP orig = gEGOrigRootTBCViewDidLoad;
+    if (orig) @try { ((void (*)(id, SEL))orig)(self, _cmd); } @catch (NSException *e) {}
+    @try {
+        if ([self isKindOfClass:[UITabBarController class]]) {
+            EGApplyAllRules((UITabBarController *)self, "viewDidLoad");
+        }
+    } @catch (NSException *e) { EGDiag(@"[规则] viewDidLoad 异常: %@", e.reason); }
+}
+
+static void EGRootTBCViewWillAppearHook(id self, SEL _cmd, BOOL animated) {
+    IMP orig = gEGOrigRootTBCViewWillAppear;
+    if (orig) @try { ((void (*)(id, SEL, BOOL))orig)(self, _cmd, animated); } @catch (NSException *e) {}
+    @try {
+        if ([self isKindOfClass:[UITabBarController class]]) {
+            EGApplyAllRules((UITabBarController *)self, "viewWillAppear");
+        }
+    } @catch (NSException *e) { EGDiag(@"[规则] viewWillAppear 异常: %@", e.reason); }
+}
+
+static void EGMineViewWillAppearHook(id self, SEL _cmd, BOOL animated) {
+    IMP orig = gEGOrigMineViewWillAppear;
+    if (orig) @try { ((void (*)(id, SEL, BOOL))orig)(self, _cmd, animated); } @catch (NSException *e) {}
+    @try {
+        if ([self isKindOfClass:[UIViewController class]]) {
+            EGApplyMineAdRule(((UIViewController *)self).view, "mine-page-willAppear");
+        }
+    } @catch (NSException *e) { EGDiag(@"[规则] mine willAppear 异常: %@", e.reason); }
+}
+
+// 通用安装器：给**指定的这一个类**挂它**自己实现**的那份方法。
+// 与 EGSafeInstanceMethod 的区别：这里**必须**是自己的实现（EGOwnMethod），
+// 不允许落到父类 —— 落到父类就会影响全 App。
+static BOOL EGInstallOne(Class c, SEL sel, IMP hook, IMP *outOrig, const char *what) {
+    if (!c) return NO;
+    Method own = EGOwnMethod(c, sel);
+    if (!own) {
+        EGDiag(@"[规则·钩子] %s 没有自己的 -%@ —— 跳过（不落到父类）",
+               class_getName(c), NSStringFromSelector(sel));
+        return NO;
+    }
+    IMP cur = method_getImplementation(own);
+    if (cur == hook) return YES;               // 幂等
+    IMP prev = method_setImplementation(own, hook);
+    if (outOrig) *outOrig = prev;
+    EGDiag(@"[规则·钩子] %s -%@ 已装（orig=%p）",
+           class_getName(c), NSStringFromSelector(sel), (void *)prev);
+    (void)what;
+    return YES;
+}
+
+static void EGInstallRulesHooks(void) {
+#if EG_ENABLE_RULES
+    if (gEGRulesHooksInstalled) return;
+    gEGRulesHooksInstalled = YES;
+
+    Class tbc = objc_getClass("RootTabBarController");
+    if (tbc) {
+        EGInstallOne(tbc, @selector(viewDidLoad), (IMP)EGRootTBCViewDidLoadHook,
+                     &gEGOrigRootTBCViewDidLoad, "tbc.viewDidLoad");
+        EGInstallOne(tbc, @selector(viewWillAppear:), (IMP)EGRootTBCViewWillAppearHook,
+                     &gEGOrigRootTBCViewWillAppear, "tbc.viewWillAppear");
+    } else {
+        EGDiag(@"[规则·钩子] 找不到 RootTabBarController —— 底栏规则无法生效");
+    }
+
+    Class mine = objc_getClass(EG_RULE_MINE_TABLE_VC);
+    if (mine) {
+        EGInstallOne(mine, @selector(viewWillAppear:), (IMP)EGMineViewWillAppearHook,
+                     &gEGOrigMineViewWillAppear, "mine.viewWillAppear");
+    } else {
+        EGDiag(@"[规则·钩子] 找不到 %s —— 广告规则只能靠周期巡检", EG_RULE_MINE_TABLE_VC);
+    }
+
+    EGInstallHeightHook();
+#endif
+}
+
+// ---- 周期巡检：兜住"钩子时机没赶上"的情况 ----
+// 为什么不只靠钩子：hook 装在 viewDidLoad/viewWillAppear: 上，若宿主在
+// **更早的时机**就把 viewControllers 塞好了、且那之后不再走这两个方法，
+// 钩子就永远等不到。周期巡检与钩子**互为兜底**，任一通道生效即可。
+// 只在"还没达成目标"时才继续巡检，达成后自动停 —— 不做无谓的常驻开销。
+static NSUInteger gEGWatchRounds = 0;
+
+static void EGWatchMinePage(void) {
+#if EG_ENABLE_RULES
+    if (gEGGuardTripped) return;
+    if (gEGTabBarNarrowed && gEGAdCellHiddenCount > 0) return;   // 两条都达成 -> 收工
+    gEGWatchRounds++;
+
+    @try {
+        NSArray *tbcs = EGFindTabBarControllers();
+        for (id t in tbcs) {
+            if ([t isKindOfClass:[UITabBarController class]]) {
+                EGApplyAllRules((UITabBarController *)t, "watchdog");
+            }
+        }
+    } @catch (NSException *e) {
+        EGDiag(@"[规则·巡检] 异常: %@", e.reason);
+    }
+
+    if (gEGWatchRounds == 1 || gEGWatchRounds % 5 == 0) {
+        EGDiag(@"[规则·巡检] 第 %lu 轮：底栏 %@ / 已塌陷广告 %lu 个",
+               (unsigned long)gEGWatchRounds,
+               gEGTabBarNarrowed ? @"已收窄" : @"未收窄",
+               (unsigned long)gEGAdCellHiddenCount);
+    }
+#endif
+}
+
 // ============================== 剪贴板 / 悬浮球 ==============================
 
 static void EGSetClipboard(NSString *text) {
@@ -1458,6 +1940,18 @@ static void EGCaptureFull(void) {
         EGReadBackCrashLog();
         [out appendFormat:@"%@\n", gEGCrashReport.length ? gEGCrashReport : @"(无崩溃记录)\n"];
 
+        // ★ v0.2：规则执行状态 —— 一眼看出"改成了没有"
+        [out appendString:@"\n===== v0.2 规则状态 =====\n"];
+        [out appendFormat:@"  底栏钩子已装   = %@\n", gEGRulesHooksInstalled ? @"是" : @"否"];
+        [out appendFormat:@"  底栏已收窄     = %@（累计移除 %lu 个）\n",
+            gEGTabBarNarrowed ? @"是" : @"否", (unsigned long)gEGTabBarCutCount];
+        [out appendFormat:@"  广告位已塌陷   = %lu 个 cell\n", (unsigned long)gEGAdCellHiddenCount];
+        [out appendFormat:@"  行高钩子已装   = %@\n", gEGHeightHookInstalled ? @"是" : @"否"];
+        [out appendFormat:@"  广告行号已登记 = %lu 条\n",
+            (unsigned long)(gEGAdRowKeys ? gEGAdRowKeys.count : 0)];
+        [out appendFormat:@"  巡检轮次       = %lu\n", (unsigned long)gEGWatchRounds];
+        [out appendString:@"\n"];
+
         [out appendString:@"\n===== 底栏取证 =====\n"];
         [out appendString:EGTabBarForensics()];
 
@@ -1625,6 +2119,10 @@ static void EGEnsureStarted(void) {
     } else {
         // 开关关闭时这个函数自身就是"写日志说明被关掉"的实现，调用点不必再包 #if
         EGInstallViewDidAppearHook();
+
+        // ★ v0.2：装规则钩子（底栏收窄 + 广告位塌陷）
+        EGInstallRulesHooks();
+        EGJournal(gEGRulesHooksInstalled ? "rules-hooks-ok" : "rules-hooks-skip");
     }
 
 #if ENABLE_FLOAT_BUTTON
@@ -1657,6 +2155,30 @@ static void EGEnsureStarted(void) {
         EGDiag(@"[类名扫描] 「我的」页相关：\n%@", EGScanClassNames(EG_SCAN_KEYWORDS_MINE, 60));
     });
 #endif
+
+    // ★ v0.2 规则巡检：见 EGWatchMinePage 上方那段（钩子与巡检验互为兜底）。
+    //   前 5 秒每 1 秒一次（覆盖启动期），之后每 5 秒一次，达成目标即自停。
+    if (!gEGGuardTripped) {
+        static dispatch_source_t sWatchTimer = NULL;
+        EGAfterOnMain(2.0, ^{
+            EGWatchMinePage();
+            EGAfterOnMain(1.0, ^{ EGWatchMinePage(); });
+            EGAfterOnMain(2.0, ^{ EGWatchMinePage(); });
+            EGAfterOnMain(3.5, ^{ EGWatchMinePage(); });
+        });
+        if (!sWatchTimer) {
+            dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                                         dispatch_get_main_queue());
+            if (t) {
+                dispatch_source_set_timer(t,
+                    dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
+                    (uint64_t)(5.0 * NSEC_PER_SEC), (uint64_t)(0.5 * NSEC_PER_SEC));
+                dispatch_source_set_event_handler(t, ^{ EGWatchMinePage(); });
+                sWatchTimer = t;
+                dispatch_resume(t);
+            }
+        }
+    }
 
     EGJournal("timers-armed");
 
