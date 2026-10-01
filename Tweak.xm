@@ -1421,16 +1421,27 @@ static IMP  gEGOrigHeightForRow    = NULL;
 static BOOL gEGHeightHookInstalled = NO;
 
 static CGFloat EGHeightForRowHook(id self, SEL _cmd, UITableView *tv, NSIndexPath *ip) {
-    CGFloat h = 0;
     IMP orig = gEGOrigHeightForRow;
-    if (orig) {
-        @try {
-            h = ((CGFloat (*)(id, SEL, UITableView *, NSIndexPath *))orig)(self, _cmd, tv, ip);
-        } @catch (NSException *e) {
-            EGDiag(@"[规则·行高] 原实现抛异常: %@", e.reason);
-            return h;
-        }
+
+    // ★★ 安全闸（第二道）：orig 为空时**不返回 0**，而是返回 UITableView 的默认行高。
+    //    为什么：本函数一旦被装上，就接管了这个类**全部**的行高计算。
+    //    若 orig 拿不到（极端情况），返回 0 会让整页行高归零 —— 页面完全空白，
+    //    比"广告没去掉"严重得多。所以这里宁可退回一个保守默认值。
+    //    安装侧（EGInstallHeightHook）已经保证 orig 非空才安装；这里是纵深防御。
+    if (!orig) {
+        static BOOL logged = NO;
+        if (!logged) { logged = YES; EGDiag(@"[规则·行高] [!] orig 为空 —— 退回默认行高 44，不做任何改动"); }
+        return 44.0;
     }
+
+    CGFloat h = 0;
+    @try {
+        h = ((CGFloat (*)(id, SEL, UITableView *, NSIndexPath *))orig)(self, _cmd, tv, ip);
+    } @catch (NSException *e) {
+        EGDiag(@"[规则·行高] 原实现抛异常: %@ —— 退回默认行高", e.reason);
+        return 44.0;
+    }
+
     @try {
         if (EGIsAdRowRegistered(tv, ip)) {
             if (h > 0.5) {
@@ -1442,9 +1453,11 @@ static CGFloat EGHeightForRowHook(id self, SEL _cmd, UITableView *tv, NSIndexPat
     return h;
 }
 
-// 装行高钩子。**只在 `MyInfoViewControllerNew` 自己实现了 heightForRowAtIndexPath:
-// 时才装** —— 若它没实现（继承 UITableView 的），换父类 IMP 会波及全 App 的表格。
-// 这是硬约束，不是优化。
+// 装行高钩子。
+//   · 目标类自己有实现 -> 直接换 IMP
+//   · 目标类没有实现   -> class_addMethod 给它加一个**只作用于这个子类**的覆盖
+//   · 父类链上也拿不到原实现 -> **放弃**（加覆盖会让整页行高变 0）
+// 三条路径的判据与后果都写在上面的分支注释里。
 static void EGInstallHeightHook(void) {
     if (gEGHeightHookInstalled) return;
     Class c = objc_getClass(EG_RULE_MINE_TABLE_VC);
@@ -1453,18 +1466,52 @@ static void EGInstallHeightHook(void) {
         return;
     }
     SEL sel = @selector(tableView:heightForRowAtIndexPath:);
-    Method own = EGOwnMethod(c, sel);          // 只认**自己**实现的那份
-    if (!own) {
-        EGDiag(@"[规则·行高] %s 没有自己的 %@ —— 不装钩子（避免波及全 App 的 tableView）",
+
+    // type encoding：CGFloat 在 64 位上是 d (double)；
+    //   d@:@@   = CGFloat (self, _cmd, UITableView *, NSIndexPath *)
+    // 这个字符串必须准确 —— 返回类型写错会让调用方按错误的宽度读返回值。
+    static const char *kTypes = "d@:@@";
+
+    Method own = EGOwnMethod(c, sel);
+    if (own) {
+        // (a) 自己有实现 —— 直接换
+        IMP cur = method_getImplementation(own);
+        if (cur == (IMP)EGHeightForRowHook) { gEGHeightHookInstalled = YES; return; }
+        gEGOrigHeightForRow = method_setImplementation(own, (IMP)EGHeightForRowHook);
+        gEGHeightHookInstalled = YES;
+        EGDiag(@"[规则·行高] 已装 %s -%@（自有实现，orig=%p）",
+               EG_RULE_MINE_TABLE_VC, NSStringFromSelector(sel), (void *)gEGOrigHeightForRow);
+        return;
+    }
+
+    // (b) 没有自己的实现 —— 给它加一个覆盖。
+    //     orig 取**父类**那份（UITableViewDelegate 链上的），这样我们的 hook
+    //     调 orig 得到的是宿主原本的行高逻辑，而不是我们自己的。
+    //     ★ 影响面被限制在 MyInfoViewControllerNew 这一个类上，不碰 UITableViewController。
+    Method inherited = EGSafeInstanceMethod(c, sel);
+    IMP inheritedIMP = inherited ? method_getImplementation(inherited) : NULL;
+
+    // ★★ 安全闸：父类链上也没有实现 -> **绝不加覆盖**。
+    //    因为我们的 hook 在 orig 为 NULL 时返回 0，那会把**整个「我的」页所有行高变成 0**
+    //    —— 页面彻底空白。这比"广告没去掉"严重得多。
+    //    "改不动就不改"永远优于"改出一个更坏的结果"。
+    if (!inheritedIMP) {
+        EGDiag(@"[规则·行高] %s 自身与父类链都没有 -%@ 的实现 -> **放弃规则 3**"
+                @"（加覆盖会让整页行高变 0）。广告塌陷仍由规则 2 负责。",
                EG_RULE_MINE_TABLE_VC, NSStringFromSelector(sel));
         return;
     }
-    IMP cur = method_getImplementation(own);
-    if (cur == (IMP)EGHeightForRowHook) { gEGHeightHookInstalled = YES; return; }
-    gEGOrigHeightForRow = method_setImplementation(own, (IMP)EGHeightForRowHook);
-    gEGHeightHookInstalled = YES;
-    EGDiag(@"[规则·行高] 已装 %s -%@（orig=%p）",
-           EG_RULE_MINE_TABLE_VC, NSStringFromSelector(sel), (void *)gEGOrigHeightForRow);
+
+    if (class_addMethod(c, sel, (IMP)EGHeightForRowHook, kTypes)) {
+        gEGOrigHeightForRow = inheritedIMP;
+        gEGHeightHookInstalled = YES;
+        EGDiag(@"[规则·行高] 已加覆盖 %s -%@（继承实现，orig=%p）",
+               EG_RULE_MINE_TABLE_VC, NSStringFromSelector(sel), (void *)inheritedIMP);
+    } else {
+        EGDiag(@"[规则·行高] class_addMethod 失败 %s -%@ —— 规则 3 不生效，"
+                @"只能靠规则 2 覆盖已实例化的 cell",
+               EG_RULE_MINE_TABLE_VC, NSStringFromSelector(sel));
+    }
 }
 
 // 从任意 view 向上找它所在的 UITableView（含 indexPath 反查）
@@ -1639,24 +1686,63 @@ static void EGMineViewWillAppearHook(id self, SEL _cmd, BOOL animated) {
     } @catch (NSException *e) { EGDiag(@"[规则] mine willAppear 异常: %@", e.reason); }
 }
 
-// 通用安装器：给**指定的这一个类**挂它**自己实现**的那份方法。
-// 与 EGSafeInstanceMethod 的区别：这里**必须**是自己的实现（EGOwnMethod），
-// 不允许落到父类 —— 落到父类就会影响全 App。
-static BOOL EGInstallOne(Class c, SEL sel, IMP hook, IMP *outOrig, const char *what) {
+// 通用安装器：给**指定的这一个类**挂钩子。
+//
+// ★ 两种情形分开处理，这是关键：
+//   (a) 目标类**自己有**这个方法的实现
+//       -> method_setImplementation，orig 就是它原来的 IMP。调用链：
+//          [self viewDidLoad] -> 我们的 hook -> 原 IMP。干净。
+//   (b) 目标类**没有**自己的实现（继承父类的）
+//       -> **不能**去改父类的 IMP（会波及全 App 同父类的所有对象）。
+//          正确做法是 class_addMethod 给**这个子类**加一个覆盖，orig 取父类那份 IMP。
+//          调用链：[self viewDidLoad] -> 我们的 hook -> 父类 IMP。同样干净，且影响面
+//          被限制在这一个子类里。
+//
+//   ★ 早前的 EGInstallOne 只做了 (a)，遇到 (b) 直接放弃 —— 那会让规则只能靠巡检兜底。
+//     实测数据回答不了"RootTabBarController 有没有自己实现 viewDidLoad"这个问题
+//     （抓取只 dump 了对象状态，没有 dump 方法归属）。既然两种情形都有正确解法，
+//     就不该把一个可以解决的问题留给兜底通道。
+//
+// 为什么这里加方法安全、而 v0.1 在 %ctor 里动宿主是危险的：时机完全不同。
+//   这里在主队列上、宿主 +load 跑完之后、只加**一个子类的一个方法**；
+//   v0.1 是在 dyld 初始化阶段覆盖宿主的信号处理器和备用栈。
+static BOOL EGInstallOne(Class c, SEL sel, IMP hook, const char *types,
+                         IMP *outOrig, const char *what) {
     if (!c) return NO;
-    Method own = EGOwnMethod(c, sel);
-    if (!own) {
-        EGDiag(@"[规则·钩子] %s 没有自己的 -%@ —— 跳过（不落到父类）",
+    if (!types) {
+        EGDiag(@"[规则·钩子] %s -%@ 未提供 type encoding —— 跳过",
                class_getName(c), NSStringFromSelector(sel));
         return NO;
     }
-    IMP cur = method_getImplementation(own);
-    if (cur == hook) return YES;               // 幂等
-    IMP prev = method_setImplementation(own, hook);
-    if (outOrig) *outOrig = prev;
-    EGDiag(@"[规则·钩子] %s -%@ 已装（orig=%p）",
-           class_getName(c), NSStringFromSelector(sel), (void *)prev);
-    (void)what;
+
+    Method own = EGOwnMethod(c, sel);
+    if (own) {
+        // (a) 自己有实现
+        IMP cur = method_getImplementation(own);
+        if (cur == hook) return YES;                 // 幂等
+        IMP prev = method_setImplementation(own, hook);
+        if (outOrig) *outOrig = prev;
+        EGDiag(@"[规则·钩子] %s -%@ 已装（自有实现，orig=%p）%s",
+               class_getName(c), NSStringFromSelector(sel), (void *)prev, what ? what : "");
+        return YES;
+    }
+
+    // (b) 没有自己的实现 —— 给这个子类加一个覆盖
+    //     先看看能不能从父类链上拿到原实现（拿到就把父类 IMP 当 orig，否则 orig=NULL）
+    Method inherited = EGSafeInstanceMethod(c, sel);
+    IMP inheritedIMP = inherited ? method_getImplementation(inherited) : NULL;
+
+    if (!class_addMethod(c, sel, hook, types)) {
+        EGDiag(@"[规则·钩子] %s -%@ class_addMethod 失败（可能已被别的 hook 加了）",
+               class_getName(c), NSStringFromSelector(sel));
+        return NO;
+    }
+    // class_addMethod 成功后，刚才加进去的就是我们的 hook。
+    // 若此时调用 method_getImplementation(class_getInstanceMethod(...)) 会拿到 hook 自己，
+    // 所以 orig 必须用**加之前**就从父类拿到的那个 IMP。
+    if (outOrig) *outOrig = inheritedIMP;
+    EGDiag(@"[规则·钩子] %s -%@ 已加覆盖（继承实现，orig=%p）%s",
+           class_getName(c), NSStringFromSelector(sel), (void *)inheritedIMP, what ? what : "");
     return YES;
 }
 
@@ -1667,18 +1753,22 @@ static void EGInstallRulesHooks(void) {
 
     Class tbc = objc_getClass("RootTabBarController");
     if (tbc) {
+        // type encoding 必须**写死**：class_addMethod 走的是 (b) 分支时需要它。
+        //   "v@:"        = void (self, _cmd)
+        //   "v@:B"       = void (self, _cmd, BOOL)   —— viewWillAppear: 的参数是 BOOL
+        // 写错会导致调用约定不匹配、栈错位 —— 所以这里只对照苹果文档写死，不做推断。
         EGInstallOne(tbc, @selector(viewDidLoad), (IMP)EGRootTBCViewDidLoadHook,
-                     &gEGOrigRootTBCViewDidLoad, "tbc.viewDidLoad");
+                     "v@:", &gEGOrigRootTBCViewDidLoad, "tbc.viewDidLoad");
         EGInstallOne(tbc, @selector(viewWillAppear:), (IMP)EGRootTBCViewWillAppearHook,
-                     &gEGOrigRootTBCViewWillAppear, "tbc.viewWillAppear");
+                     "v@:B", &gEGOrigRootTBCViewWillAppear, "tbc.viewWillAppear");
     } else {
-        EGDiag(@"[规则·钩子] 找不到 RootTabBarController —— 底栏规则无法生效");
+        EGDiag(@"[规则·钩子] 找不到 RootTabBarController —— 底栏规则只能靠周期巡检");
     }
 
     Class mine = objc_getClass(EG_RULE_MINE_TABLE_VC);
     if (mine) {
         EGInstallOne(mine, @selector(viewWillAppear:), (IMP)EGMineViewWillAppearHook,
-                     &gEGOrigMineViewWillAppear, "mine.viewWillAppear");
+                     "v@:B", &gEGOrigMineViewWillAppear, "mine.viewWillAppear");
     } else {
         EGDiag(@"[规则·钩子] 找不到 %s —— 广告规则只能靠周期巡检", EG_RULE_MINE_TABLE_VC);
     }

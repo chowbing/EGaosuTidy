@@ -4,19 +4,117 @@
 **底栏 5 个 tab（首页 / 车主服务 / 会员服务 / 商城 / 我的）精简到只剩「我的」**，
 并清掉**「我的」页中「我的订单」与「我的服务」之间的图片广告**（"移动积分兑高速通行券"横幅）。
 
-当前版本：**v0.1.2-probe —— 纯探针，只取证、不改任何界面行为。**
+当前版本：**v0.2.0-rules —— 实测驱动的规则版，目标功能已实现。**
 
 ---
 
-## 0. 现在最要紧的事：判定「闪退是不是插件引起的」
+## 0. 结论先行：Q1–Q4 全部有实测答案（2026-10-01 真机抓取）
 
-真机上连续两次启动即闪退（v0.1 与 v0.1.1 各一次）。两份 `.ips` 都显示
+v0.1.2 探针在真机上跑通并回传了两份完整抓取（首页 + 我的页）与一份完整诊断。
+四个关键未知量全部落地，**没有一个字是猜的**：
+
+| 问题 | 实测答案 | 依据 |
+|---|---|---|
+| **Q1** 底栏是系统控件还是自绘？ | **原生 `UITabBarController`** | `e高速.RootTabBarController : UITabBarController`；`tabBar` 是标准 `UITabBar`，5 个 `UITabBarButton` 直接子视图 |
+| **Q2** 5 个 tab 的身份字段？ | 见下表 | `viewControllers` + `tabBarItem.title` + `tag` 三处交叉 |
+| **Q3** 广告是什么类型？ | **原生 cell，非 H5** | `e高速.MyInfoViewControllerBannerCell`，内含 `ZCycleView` → `UICollectionView` → `ZCycleViewCell` |
+| **Q4** 页面是原生还是 H5？ | **原生** | 整个「我的」页是 `UITableView` + 原生 cell；`HTMLAdvertisingNewViewController` 不出现在任何页面 VC 链中 |
+
+### 0.1 底栏 5 个 tab 的实测身份（Q2 明细）
+
+| idx | `viewControllers[i]` | 其 `topViewController` 类名 | `tabBarItem.title` | `tag` |
+|---|---|---|---|---|
+| 0 | `RootNavigationController` | `FunctionMenuHomePageViewController` | 首页 | 0 |
+| 1 | `RootNavigationController` | `TheOwnerServiceMainViewController` | 车主服务 | 0 |
+| 2 | `RootNavigationController` | `ETCMemberMainViewController` | 会员服务 | 0 |
+| 3 | `RootNavigationController` | `MallMainContorller` | 商城 | 0 |
+| 4 | `RootNavigationController` | **`MyInfoViewControllerNew`** | **我的** | 0 |
+
+★ **两个关键结论**：
+1. **`tag` 全部为 0 → 不可用作识别键。** 识别必须落到 `topViewController` 的类名上
+   （外层 5 个都是 `RootNavigationController`，看不出区别）。
+2. `tabBarItem.title` 可用作二次校验，但类名是主判据。
+
+---
+
+## 1. v0.2.0 做了什么（三条规则）
+
+### 规则 1 — 底栏只留「我的」
+
+* 挂 `RootTabBarController` 的 `viewDidLoad` **和** `viewWillAppear:`（**都挂**）。
+  * 为什么都挂：实测只能证明"运行时它有 5 个"，**不能证明"5 个是何时塞进去的"**。
+    两个时机都挂 + 幂等 = 不依赖时序假设。
+* 识别「我的」：剥掉 `RootNavigationController` 取 `topViewController` 类名，
+  等于 `MyInfoViewControllerNew` 即命中；`tabBarItem.title == "我的"` 作兜底。
+* 动作：**重建 `viewControllers` 数组**（保留命中的**原实例**），`selectedIndex = 0`。
+  不用 `removeObjectAtIndex:` —— 重建数组最干净，也不动对象引用关系。
+* **保护性退出**：一个都没匹配上就**什么都不做**。
+  宁可不动，也不要把底栏清空。识别失败时"不动"永远优于"乱动"。
+
+### 规则 2 — 广告位隐藏 **并塌陷**
+
+* 遍历「我的」页视图树，命中 `MyInfoViewControllerBannerCell` → `hidden = YES`
+  **且** `frame.height = 0`。
+* **为什么必须同时做**：「不显示」和「不占位」是两件事。只 `hidden`
+  会留下一条 79pt 的空白。
+* 遍历时顺手把该 cell 所在的 `tableView` + `indexPath` **登记**进一张表（见规则 3）。
+
+### 规则 3 — 广告行高归零（覆盖屏幕外、尚未实例化的那一行）
+
+* `UITableView` 只实例化**可见区域**的 cell。广告行在屏幕外时，规则 2 的遍历
+  根本看不到它 —— 用户一滚就冒出来。
+* 做法：hook `MyInfoViewControllerNew` 的
+  `tableView:heightForRowAtIndexPath:`，查登记表，命中即返回 0。
+* **硬约束**：只在**这个类自己实现了**该方法时才挂钩子。
+  若它没实现（继承 `UITableView` 的），换父类 IMP 会波及全 App 所有 tableView ——
+  这种情况我们**不动**，并记日志说明"因能力不足而放弃"。
+
+### 时机关兜底 — 周期巡检
+
+钩子可能赶不上（若宿主在更早时机就配好了且之后不再走这两个方法）。
+所以另有一条巡检：启动后 2/3/5/6.5 秒各跑一轮，之后每 5 秒一轮，
+**两条规则都达成即自动停止**。钩子与巡检验**互为兜底，任一通道生效即可**。
+
+---
+
+## 2. 安全性设计（每条都对应一次真实翻车）
+
+* **单类单 selector 单 shim。** 绝不用"每个实现类各一份"的通用安装器 —— 共享 shim
+  无法区分直接调用与 `[super]` 调用，会无限递归爆栈（511 帧实锤过）。
+* **不落到父类。** 所有 `method_setImplementation` 都要求目标类**自己有**实现
+  （`EGOwnMethod`）；没有就放弃并记日志。
+* **识别失败 → 什么都不做。** 规则引擎的第一条纪律。
+* **幂等。** 每次重新计算，已完成就跳过；不靠"哪一次时机是对的"这种假设。
+* **`@try/@catch` 全包。** 但清楚它的边界：异常在 `dispatch_once`/libdispatch 边界
+  会被吞成 `std::terminate`，所以关键路径仍靠"不做事"来保证安全。
+* **`%ctor` 只做一次 `dispatch_async`**（v0.1.1 起的纪律，未改）。
+
+---
+
+## 3. 真机操作
+
+右上角蓝色圆点 **EG**（可拖动）：
+
+| 操作 | 作用 |
+|---|---|
+| **点一下** | 抓当前页 → 底栏取证 + 视图树 + 广告候选 → 写剪贴板（按钮闪字节数自证） |
+| **长按**（0.6s） | 完整诊断 → 启动流水 + 规则状态 + 类名扫描 + 崩溃回读 → 写剪贴板 |
+| **拖动** | 移开按钮，避免遮挡 |
+
+v0.2 额外：**长按后的诊断文本里有一节「v0.2 规则状态」**，
+直接告诉你底栏收窄没有、广告塌陷了几个、行高钩子装上没有、巡检跑了几轮。
+
+---
+
+## 4. 历史：v0.1.2 的四台阶判定（仍保留）
+
+真机上曾连续两次启动即闪退（v0.1 与 v0.1.1 各一次）。两份 `.ips` 都显示
 **崩溃栈上没有任何一帧属于我们的 dylib**。但"不在栈上"不等于"无责任"——
 也可能是**镜像被加载**这件事本身触发了宿主的反注入检测。
 
 为了不再一轮一轮猜，v0.1.2 把这个问题拆成**四个互不重叠的台阶**，一轮 CI 全出。
 
-### 0.1 台阶表（真机上按顺序做，**第一个开始崩的台阶就是嫌疑层**）
+### 4.1 台阶表（真机上按顺序做，**第一个开始崩的台阶就是嫌疑层**）
 
 | 台阶 | dylib | 它做了什么 | 它回答什么 |
 |---|---|---|---|
@@ -24,7 +122,7 @@
 | **1** | `EGaosuTidy-minimal.dylib` | `%ctor` **完全为空**（连 `NSLog` 都不调） | 「我们的镜像被 dyld 加载」本身是否被检测 |
 | **2** | `EGaosuTidy-dispatchonly.dylib` | `%ctor` 写一行流水 + 一次 `dispatch_async`，块里什么都不做 | 在 `%ctor` 里碰 libdispatch 是否安全 |
 | **3** | `EGaosuTidy-nofloat.dylib` | 完整启动流程（Foundation / 文件 IO / 自愈 / 定时任务），**不装悬浮球** | 窗口 / 视图操作有没有问题 |
-| **4** | `EGaosuTidy-normal.dylib` | 完整探针 | 正式取数 |
+| **4** | `EGaosuTidy-normal.dylib` | 完整插件（探针 + v0.2 规则） | 正式使用 |
 
 **判读规则（结合启动流水交叉验证，不需要额外跑轮次）：**
 
@@ -37,7 +135,16 @@
                                                     （再对照台阶 1：台阶 1 空 ctor 不崩，
                                                      说明"空 ctor 能跑"，那就是那行流水写入的问题）
 台阶 2 不崩、台阶 3 崩    → 悬浮球 / 窗口 / 定时器
-台阶 3 不崩、台阶 4 崩    → 只剩延迟任务（viewDidAppear 钩子已默认关闭）
+台阶 3 不崩、台阶 4 崩    → 延迟任务或规则钩子
+```
+
+### 4.2 已知事实（重要，避免误判）
+
+* **降级前的 App 版本 5.10.7 (build 2) / iOS 16.6.1 上，四个变体全部闪退。**
+* 之后 Shawn **降级了 App**，其中一个变体成功启动并进入界面（悬浮球可见）。
+* **因此"四个台阶全部崩溃"这个结论是在 5.10.7 上测的，不适用于当前运行的版本。**
+  当前的实测抓取数据来自降级后的版本（具体版本号待补）。
+
 ```
 
 **为什么 `dispatchonly` 里要在 `%ctor` 写一行流水**：这样"崩在 ctor 里"和"崩在
