@@ -1445,9 +1445,15 @@ static CGFloat EGHeightForRowHook(id self, SEL _cmd, UITableView *tv, NSIndexPat
     @try {
         if (EGIsAdRowRegistered(tv, ip)) {
             if (h > 0.5) {
-                EGDiag(@"[规则·行高] %@ -> 0（原 %.0f，已登记为广告行）", ip, (double)h);
+                EGDiag(@"[规则·行高] %@ -> 0.5（原 %.0f，已登记为广告行）", ip, (double)h);
             }
-            h = 0;
+            // ★ 返回 **0.5 而不是 0**。理由（这是本项目踩过的坑，见 skill Gotcha 29）：
+            //   高度为 0 = 空矩形。CGRectIntersectsRect 对空矩形返回 NO ->
+            //   这一行会掉出可见区域计算 -> cell 被回收 -> 我们赖以识别身份的
+            //   类名（MyInfoViewControllerBannerCell）随之丢失 -> 下一轮它又回到 79 高。
+            //   结果是 0/79 振荡 = 肉眼可见的闪烁。
+            //   0.5pt 不可见，但矩形非空，身份得以保留，塌陷稳定。
+            h = 0.5;
         }
     } @catch (NSException *e) {}
     return h;
@@ -1586,11 +1592,14 @@ static void EGApplyMineAdRule(UIView *root, const char *reason) {
                 // 幂等：已经隐藏且高度为 0 就不再动
                 if (!origHidden || origH > 0.5) {
                     v.hidden = YES;
+                    // ★ 高度设 0.5 而不是 0 —— 与 EGHeightForRowHook 同一理由：
+                    //   空矩形会让本行掉出可见区域计算、cell 被回收，我们就再也扫不到它。
+                    //   0.5pt 肉眼不可见，但保持"非空矩形"，身份稳定。
                     CGRect f = v.frame;
-                    f.size.height = 0;
+                    f.size.height = 0.5;
                     v.frame = f;
                     n++;
-                    EGDiag(@"[规则·广告] 隐藏并塌陷 %@  frame=(%.0f,%.0f,%.0f,%.0f) -> h=0  行=%@",
+                    EGDiag(@"[规则·广告] 隐藏并塌陷 %@  frame=(%.0f,%.0f,%.0f,%.0f) -> h=0.5  行=%@",
                            NSStringFromClass([v class]),
                            f.origin.x, f.origin.y, f.size.width, origH,
                            ip ? [NSString stringWithFormat:@"%ld.%ld", (long)ip.section, (long)ip.row] : @"(未定位)");
