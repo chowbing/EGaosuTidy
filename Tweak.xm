@@ -113,7 +113,7 @@
 // ============================== 配置 ==============================
 
 #define EG_TAG              "EGaosuTidy"
-#define EG_VERSION          "0.2.2-relayout"
+#define EG_VERSION          "1.0.0-release"
 // ★ bundle id：真机 .ips 实测（2026-09-30 23:21:29）是 com.sdhsie.westeros.weirwood。
 //   之前写的 com.sdhs.easy.high.road 是从三个 Android 商店包名**推断**的 —— 推断错了。
 //   iOS 与 Android 的 bundle id 不保证一致，这条只能靠实测。
@@ -131,6 +131,40 @@
 #define ENABLE_TABBAR_FORENSICS  1   // 底栏构造取证
 #define ENABLE_CLASS_SCAN        1   // 全进程类名扫描（一次性，启动后跑）
 #define ENABLE_AUTO_DUMP         1   // 启动后自动 dump 一次底栏（用户没点也能拿到数据）
+
+// ============================================================================
+// ★★ 正式版发布开关（EG_RELEASE） ==========================================
+// ============================================================================
+// 1 = 干净交付。逐条说明**关掉什么、为什么关、留下什么**：
+//
+//   关：ENABLE_FLOAT_BUTTON —— 右上角那个 EG 圆圈。它是**取数工具**，不是功能。
+//       目标达成后它就是屏幕上多余的一个圆，Shawn 明确要求去掉。
+//   关：ENABLE_AUTO_DUMP / ENABLE_CLASS_SCAN —— 启动后定时 dump 底栏 + 全进程类名扫描。
+//       两者的唯一消费者是"长按 EG 看诊断"，按钮没了它们就没人读；
+//       而全进程类名扫描（1597 个类）每次启动都要跑一遍，纯属浪费。
+//   留：EG_ENABLE_RULES —— 三条规则是**功能本体**，必须开着。
+//   留：ENABLE_LAUNCH_JOURNAL / EG_JOURNAL_MIRROR —— 这是**唯一的崩溃出口**。
+//       悬浮球没了之后，万一将来某版启动就崩，只剩"上次未正常结束 → 流水镜像到剪贴板"
+//       这一条路能拿到证据。它只在**上次没走到 confirmed** 时才写，正常使用不碰剪贴板。
+//   缩：EG_DIAG_CAP —— 诊断缓冲没有读者了，从 200000 缩到 8000，别白占内存。
+//
+// ★ 审计过的边界（Gotcha 30：别以为一个 *_FORENSICS 开关只管日志）：
+//   · ENABLE_FLOAT_BUTTON 只包住 EGInstallOverlay() 一个调用点，不改任何规则行为
+//   · ENABLE_AUTO_DUMP / ENABLE_CLASS_SCAN 只包住三个 EGAfterOnMain 定时块
+//   · ENABLE_TABBAR_FORENSICS 全文**没有任何 #if 使用它** —— 它其实什么都不gate
+// ============================================================================
+#define EG_RELEASE               1
+
+#if EG_RELEASE
+#  undef  ENABLE_FLOAT_BUTTON
+#  define ENABLE_FLOAT_BUTTON    0
+#  undef  ENABLE_AUTO_DUMP
+#  define ENABLE_AUTO_DUMP       0
+#  undef  ENABLE_CLASS_SCAN
+#  define ENABLE_CLASS_SCAN      0
+#  undef  EG_DIAG_CAP
+#  define EG_DIAG_CAP            8000
+#endif
 
 // ★ 探针阶段默认**不装** UIViewController.viewDidAppear: 钩子（v0.1.2 的削减）。
 //   收益≈0：探针的全部产出靠「点 EG」+ 启动后定时 dump 拿到，这个钩子只额外补一条
