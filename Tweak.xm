@@ -113,7 +113,7 @@
 // ============================== 配置 ==============================
 
 #define EG_TAG              "EGaosuTidy"
-#define EG_VERSION          "0.2.1-namefix"
+#define EG_VERSION          "0.2.2-relayout"
 // ★ bundle id：真机 .ips 实测（2026-09-30 23:21:29）是 com.sdhsie.westeros.weirwood。
 //   之前写的 com.sdhs.easy.high.road 是从三个 Android 商店包名**推断**的 —— 推断错了。
 //   iOS 与 Android 的 bundle id 不保证一致，这条只能靠实测。
@@ -1513,7 +1513,27 @@ static void EGApplyTabBarRule(UITabBarController *tbc, const char *reason) {
 //
 //   这比"猜"稳健：**判据来自真实观察，且有两个独立通道互相兜底**
 //   （视图树遍历 + 周期巡检），任一通道生效即可。
+//
+// ★★ 但 v0.2.1 实测证明：**光有行高 hook 还不够**。
+//   「hidden + frame.height=0.5」只改了 cell 自己，UITableView **内部缓存的行高仍是 79**，
+//   于是后面所有行的 y 根本没上移 —— 页面上就是一条 79pt 的空白。
+//   实测坐标（2026-10-01 真机）：
+//     MyOrderInfoTitleCell y=189 h=86  → 结束 275
+//     BannerCell           y=275 h≈0.5   （我们改过的）
+//     MyInfoTitleCell      y=366          ← 空了 90.5 ≈ 79 + 12 正常间距
+//   **判读**：hidden/cell.frame 管的是"不显示"，行高缓存管的是"占不占位"。
+//   要消掉空白，必须让表格**重新向 dataSource 问一次行高** —— 见 EGRefreshAdRowHeights。
 static NSMutableSet<NSString *> *gEGAdRowKeys = nil;   // key = "<tableView 指针>#<section>.<row>"
+
+// 已经强制刷新过行高的行（同 key）。**每个行只刷一次** ——
+// 既避免每轮巡检都刷（闪），也避免 reload → 建 cell → 再 reload 的递归。
+static NSMutableSet<NSString *> *gEGAdRowsReloaded = nil;
+static NSUInteger gEGAdReloadCount = 0;
+
+// 兜底升级：**只做一次**的 reloadData。
+//   判据来自实测：重排后如果广告 cell 仍按 79pt 建出来，就说明 reloadRows 没生效。
+static BOOL    gEGAdReloadDataDone = NO;
+static CGFloat gEGLastAdOrigH      = -1;   // 最近一次塌陷**前**广告 cell 的实测高度
 
 static NSString *EGAdRowKey(UITableView *tv, NSIndexPath *ip) {
     if (!tv || !ip) return nil;
@@ -1665,12 +1685,95 @@ static UITableView *EGEnclosingTableView(UIView *v, NSIndexPath **outIP) {
     return nil;
 }
 
+// ============================================================================
+// ★ 消除空白的关键一步：让 UITableView **重新问一次行高** ==================
+// ============================================================================
+// 为什么必须有这一步（v0.2.1 实测翻车）：
+//   我们改的是 cell 自己的 frame，而 UITableView 内部 `_rowData` 里缓存的行高
+//   是**早先向 dataSource 问来的 79**。改 cell.frame 不会让这份缓存失效，
+//   所以后面所有行的 y 纹丝不动 —— 表现就是"广告不见了，但留了一条 79pt 的空白"。
+//
+// 正确做法是让表格自己重排：
+//   reloadRowsAtIndexPaths:  —— 苹果官方用来"改变某行高度"的 API。
+//     它会重新走 heightForRowAtIndexPath:（我们的 hook 此时返回 0.5），
+//     并把后面的行整体前移。比 reloadData 轻，不影响其他行。
+//   万一它抛异常（宿主 dataSource 状态不允许），退到
+//     beginUpdates/endUpdates —— 同样会触发一次行高重查，只是不重建 cell。
+//
+// ★ 只刷一次：key 记进 gEGAdRowsReloaded。
+//   否则 reload → 建 cell → 巡检再刷 → 再建 cell …… 会一直闪。
+// ============================================================================
+static void EGRefreshAdRowHeights(NSMapTable *tvIPs) {
+    if (!tvIPs) return;
+    @synchronized (@"EGAdRows") {
+        if (!gEGAdRowsReloaded) gEGAdRowsReloaded = [NSMutableSet set];
+    }
+
+    NSEnumerator *tvs = [tvIPs keyEnumerator];
+    UITableView *tv = nil;
+    while ((tv = [tvs nextObject])) {
+        NSMutableSet<NSIndexPath *> *ips = [tvIPs objectForKey:tv];
+        if (!ips.count) continue;
+
+        // 先做边界校验 + 去重：表格可能已经重排过，旧的 indexPath 可能越界
+        NSMutableArray<NSIndexPath *> *todo = [NSMutableArray array];
+        @synchronized (@"EGAdRows") {
+            for (NSIndexPath *ip in ips) {
+                NSString *k = EGAdRowKey(tv, ip);
+                if (!k || [gEGAdRowsReloaded containsObject:k]) continue;
+                @try {
+                    if (ip.section >= tv.numberOfSections) continue;
+                    if (ip.row >= [tv numberOfRowsInSection:ip.section]) continue;
+                } @catch (NSException *e) { continue; }
+                [todo addObject:ip];
+                [gEGAdRowsReloaded addObject:k];
+            }
+        }
+        if (!todo.count) continue;
+
+        BOOL done = NO;
+        @try {
+            [tv reloadRowsAtIndexPaths:todo withRowAnimation:UITableViewRowAnimationNone];
+            done = YES;
+            gEGAdReloadCount += todo.count;
+            EGDiag(@"[规则·广告] 已强制重排行高 %lu 行（%@）—— 表格会重新问 heightForRow，"
+                    @"后面的行随即上移",
+                   (unsigned long)todo.count,
+                   [todo componentsJoinedByString:@","]);
+        } @catch (NSException *e) {
+            EGDiag(@"[规则·广告] reloadRows 抛异常: %@ —— 退到 beginUpdates/endUpdates", e.reason);
+        }
+        if (!done) {
+            @try {
+                [tv beginUpdates];
+                [tv endUpdates];
+                gEGAdReloadCount += todo.count;
+                EGDiag(@"[规则·广告] 已用 beginUpdates/endUpdates 触发行高重查");
+            } @catch (NSException *e2) {
+                EGDiag(@"[规则·广告] beginUpdates 也失败: %@", e2.reason);
+            }
+        }
+        EGJournal("rule-ad-relayout");
+
+        // 重排后 cell 会被重建一次，新的那个还没被隐藏。
+        // 0.3s 后再扫一遍把它收掉（reloadRows 的 cell 创建不保证同步完成）。
+        EGAfterOnMain(0.3, ^{
+            @try { EGApplyMineAdRule(tv, "post-reload"); }
+            @catch (NSException *e3) {}
+        });
+    }
+}
+
 // 塌陷**一个**广告 cell：登记行号（供规则 3）+ hidden + 高度压到 0.5。
 // 返回 YES = 本轮真的动了这个 cell（用于统计，保证幂等计数不重复累加）。
-static BOOL EGCollapseAdCell(UIView *v, const char *why, NSUInteger *regOut) {
+// tvOut / ipOut：把"这个广告属于哪个表格的哪一行"回传给调用方 —— 调用方要拿它去
+// **强制表格重新问一次行高**（见 EGRefreshAdRowHeights，那是真正消除空白的一步）。
+static BOOL EGCollapseAdCell(UIView *v, const char *why, NSUInteger *regOut,
+                             UITableView **tvOut, NSIndexPath **ipOut) {
     if (!v) return NO;
     CGFloat origH = v.frame.size.height;
     BOOL origHidden = v.hidden;
+    gEGLastAdOrigH = origH;   // 留痕：用来判断"表格有没有真的按 0.5 重建这一行"
 
     // 登记行号（供规则 3）—— 独立于"是否已隐藏"，
     // 这样即使本轮因复用已被隐藏过，行号也不会漏登记
@@ -1685,6 +1788,8 @@ static BOOL EGCollapseAdCell(UIView *v, const char *why, NSUInteger *regOut) {
                 if (regOut) (*regOut)++;
             }
         }
+        if (tvOut) *tvOut = tv;
+        if (ipOut) *ipOut = ip;
     }
 
     // 幂等：已经隐藏且高度为 0 就不再动
@@ -1717,6 +1822,9 @@ static void EGApplyMineAdRule(UIView *root, const char *reason) {
         // 副判据收集：弱键 map —— cell 被回收时条目自动消失，不会留悬垂指针
         NSMapTable *zcCells = [NSMapTable mapTableWithKeyOptions:NSPointerFunctionsWeakMemory
                                                    valueOptions:NSPointerFunctionsStrongMemory];
+        // 广告行所在的「表格 -> 行号集合」，供 EGRefreshAdRowHeights 去重排版用
+        NSMapTable *tvIPs = [NSMapTable mapTableWithKeyOptions:NSPointerFunctionsWeakMemory
+                                                 valueOptions:NSPointerFunctionsStrongMemory];
         NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
         NSUInteger guard = 0;
         while (stack.count && guard++ < 20000) {
@@ -1725,7 +1833,13 @@ static void EGApplyMineAdRule(UIView *root, const char *reason) {
 
             // 主判据：cell 类名（兼容 Swift 模块前缀）
             if (EGClassNameIs(v, EG_RULE_AD_CELL_CLASS)) {
-                if (EGCollapseAdCell(v, "类名", &reg)) n++;
+                UITableView *atv = nil; NSIndexPath *aip = nil;
+                if (EGCollapseAdCell(v, "类名", &reg, &atv, &aip)) n++;
+                if (atv && aip) {
+                    NSMutableSet *s = [tvIPs objectForKey:atv];
+                    if (!s) { s = [NSMutableSet set]; [tvIPs setObject:s forKey:atv]; }
+                    [s addObject:aip];
+                }
             }
 #if EG_RULE_AD_FALLBACK_ZCYCLE
             // 副判据：类名换了（版本升级/混淆）也不至于全瞎。
@@ -1757,8 +1871,43 @@ static void EGApplyMineAdRule(UIView *root, const char *reason) {
         NSEnumerator *keys = [zcCells keyEnumerator];
         UIView *p = nil;
         while ((p = [keys nextObject])) {
-            if (EGCollapseAdCell(p, "ZCycle", &reg)) { n++; zc++; }
+            UITableView *atv = nil; NSIndexPath *aip = nil;
+            if (EGCollapseAdCell(p, "ZCycle", &reg, &atv, &aip)) { n++; zc++; }
+            if (atv && aip) {
+                NSMutableSet *s = [tvIPs objectForKey:atv];
+                if (!s) { s = [NSMutableSet set]; [tvIPs setObject:s forKey:atv]; }
+                [s addObject:aip];
+            }
         }
+
+        // ★ 真正消掉空白的一步：让表格重排一次。
+        //   放在塌陷之后 —— 先登记好行号，重排时 hook 才会返回 0.5。
+        //
+        // 兜底升级：若这是一次"重排后的补扫"、且广告 cell 仍按 79pt 建出来
+        // （gEGLastAdOrigH > 1），说明 reloadRows 没吃进去 —— 直接 reloadData。
+        // 只做一次（gEGAdReloadDataDone），避免每次巡检都整表重建。
+        BOOL escalated = NO;
+        if (reason && strcmp(reason, "post-reload") == 0 &&
+            gEGLastAdOrigH > 1.0 && !gEGAdReloadDataDone && tvIPs.count) {
+            gEGAdReloadDataDone = YES;
+            NSEnumerator *te = [tvIPs keyEnumerator];
+            UITableView *atv2 = nil;
+            while ((atv2 = [te nextObject])) {
+                @try {
+                    [atv2 reloadData];
+                    EGDiag(@"[规则·广告] 重排未生效（cell 仍按 %.0fpt 建）-> 已整表 reloadData",
+                           (double)gEGLastAdOrigH);
+                } @catch (NSException *ee) {
+                    EGDiag(@"[规则·广告] reloadData 失败: %@", ee.reason);
+                }
+                EGAfterOnMain(0.3, ^{
+                    @try { EGApplyMineAdRule(atv2, "post-reload"); }
+                    @catch (NSException *e3) {}
+                });
+            }
+            escalated = YES;
+        }
+        if (!escalated) EGRefreshAdRowHeights(tvIPs);
 
         if (n || reg) {
             gEGAdCellHiddenCount += n;
@@ -1971,7 +2120,10 @@ static NSUInteger gEGWatchRounds = 0;
 static void EGWatchMinePage(void) {
 #if EG_ENABLE_RULES
     if (gEGGuardTripped) return;
-    if (gEGTabBarNarrowed && gEGAdCellHiddenCount > 0) return;   // 两条都达成 -> 收工
+    // ★ 至少跑满 4 轮再收工。
+    //   v0.2.1 的教训：第 1 轮塌陷成功就收工了，但"表格重排 + 重建 cell 后再收一次"
+    //   这件事发生在第 1 轮**之后** —— 收工太早会漏掉重排后的补扫。
+    if (gEGTabBarNarrowed && gEGAdCellHiddenCount > 0 && gEGWatchRounds >= 4) return;
     gEGWatchRounds++;
 
     // ★ 钩子还没装全 -> 每轮重试（宿主类可能在首轮之后才被加载/注册）
@@ -2228,6 +2380,8 @@ static void EGCaptureFull(void) {
         [out appendFormat:@"  行高钩子已装   = %@\n", gEGHeightHookInstalled ? @"是" : @"否"];
         [out appendFormat:@"  广告行号已登记 = %lu 条\n",
             (unsigned long)(gEGAdRowKeys ? gEGAdRowKeys.count : 0)];
+        [out appendFormat:@"  行高已强制重排 = %lu 行  ← 空白有没有消掉就看这一项\n",
+            (unsigned long)gEGAdReloadCount];
         [out appendFormat:@"  巡检轮次       = %lu\n", (unsigned long)gEGWatchRounds];
         [out appendString:@"\n"];
 

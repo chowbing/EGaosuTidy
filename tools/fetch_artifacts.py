@@ -140,11 +140,17 @@ def main():
             else:
                 print("   %s" % n)
 
+    # ★ 只核验**本次真的构建出来**的变体。
+    #   CI 默认只出 normal（2026-10-01 起），把其余三个当成"缺失"会永远报红。
+    present = [v for v in VARIANTS if ("EGaosuTidy-%s.dylib" % v) in dylibs]
+    if not present:
+        raise SystemExit("产物包里没有任何 dylib —— 构建其实没成功")
+
     print("\n" + "=" * 74)
     print("本地独立核验（不采信 CI 自己的报告）")
     print("=" * 74)
     bad = 0
-    for v in VARIANTS:
+    for v in present:
         name = "EGaosuTidy-%s.dylib" % v
         raw = dylibs.get(name)
         if raw is None:

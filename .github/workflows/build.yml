@@ -6,12 +6,23 @@ on:
   push:
   # 也可以在网页手动触发：Actions → 左侧选 Build EGaosuTidy dylib → Run workflow
   workflow_dispatch:
+    inputs:
+      variants:
+        description: '要构建的变体（空格分隔）。正常跑留空 = 只出 normal'
+        required: false
+        default: 'normal'
 
 jobs:
   build:
     runs-on: macos-latest   # Xcode 自带 clang，原生支持 arm64-apple-darwin 目标，比 ubuntu 稳得多
     env:
       THEOS: ${{ github.workspace }}/theos
+      # ★ 默认只出 normal。
+      #   理由（Shawn 2026-10-01 明确要求）：验证哪个就编哪个，不要每次都扔 4 个包上去 ——
+      #   多出来的 3 个变体是为了定位"是不是我们的代码引起的"才存在的诊断台阶，
+      #   功能验证阶段它们只是噪音，还拖慢 CI、让产物包变大。
+      #   需要台阶时：Actions → Run workflow → variants 填 "normal nofloat dispatchonly minimal"。
+      VARIANTS: ${{ github.event.inputs.variants || 'normal' }}
       THEOS_NO_AUTO_SIGN: 1   # 尽量跳过自签；但实测该 Theos 版本仍会调 ldid，故下面显式装 ldid
 
     steps:
@@ -37,10 +48,11 @@ jobs:
           python3 tools/preflight.py Tweak.xm || true
 
       # ---------------------------------------------------------------------
-      # ★ 一轮出 4 个变体
-      #   为什么这么做：每一版 = 一轮 CI + 一次真机注入，代价大；
+      # ★ 一轮出 N 个变体（默认 N=1，只出 normal；列表由 env.VARIANTS 控制）
+      #   为什么还能出多个：每一版 = 一轮 CI + 一次真机注入，代价大；
       #   而"是不是我们的代码引起的"可以拆成**互不重叠的台阶**，一次全出更省时间。
       #   normal / nofloat / dispatchonly / minimal —— 判读规则见 Tweak.xm 配置区。
+      #   只在**排查崩溃**时才手动跑全部；日常功能验证只跑 normal。
       #
       # ★★ 产物路径必须**写死**，绝对不能用 `find .theos -name 'EGaosuTidy.dylib' | head -1`：
       #   Theos 会跑 `dsymutil <dylib>`（不带 -o），生成
@@ -54,7 +66,7 @@ jobs:
         run: |
           set +e
           mkdir -p dist
-          for V in normal nofloat dispatchonly minimal; do
+          for V in $VARIANTS; do
             make clean >/dev/null 2>&1
             rm -rf .theos
             make EG_VARIANT="$V" messages=yes > "build-$V.log" 2>&1
@@ -81,7 +93,7 @@ jobs:
       - name: Show hard errors (all variants)
         if: always()
         run: |
-          for V in normal nofloat dispatchonly minimal; do
+          for V in $VARIANTS; do
             echo "---- $V ----"
             if [ -f "build-$V.log" ]; then
               grep -n "error:" "build-$V.log" || echo "(no hard error)"
@@ -100,7 +112,7 @@ jobs:
         run: |
           mkdir -p dist
           : > dist/verify.txt
-          for V in normal nofloat dispatchonly minimal; do
+          for V in $VARIANTS; do
             F="dist/EGaosuTidy-$V.dylib"
             if [ ! -f "$F" ]; then
               echo "[$V] FAILED 缺产物" >> dist/verify.txt
@@ -135,13 +147,10 @@ jobs:
         with:
           name: build-log
           path: |
-            build-normal.log
-            build-nofloat.log
-            build-dispatchonly.log
-            build-minimal.log
+            build-*.log
             dist/verify.txt
 
-      - name: Upload dylibs (4 variants)
+      - name: Upload dylibs
         if: always()
         uses: actions/upload-artifact@v4
         with:
