@@ -1,8 +1,8 @@
 Package: com.shawn.egaosutidy
 Name: EGaosuTidy
-Version: 0.2.0
+Version: 0.2.1
 Architecture: iphoneos-arm64
-Description: 精简 e高速 App 界面：底栏只保留「我的」、移除其余四个 tab，并清掉「我的」页内的图片广告位（TrollStore/TrollFools 注入）。v0.2.0 = 实测驱动的规则版（底栏收窄 + 广告位隐藏塌陷），保留探针与 4 变体诊断能力
+Description: 精简 e高速 App 界面：底栏只保留「我的」、移除其余四个 tab，并清掉「我的」页内的图片广告位（TrollStore/TrollFools 注入）。v0.2.1 = 修复 Swift 模块名前缀导致的类名失配（规则此前一次都没被触发）；类名解析统一走模块前缀兼容，并加标题指纹 / ZCycle 双兜底
 Maintainer: Shawn
 Author: NYWF
 Section: Tweaks

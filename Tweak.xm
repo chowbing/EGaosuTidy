@@ -113,7 +113,7 @@
 // ============================== 配置 ==============================
 
 #define EG_TAG              "EGaosuTidy"
-#define EG_VERSION          "0.2.0-rules"
+#define EG_VERSION          "0.2.1-namefix"
 // ★ bundle id：真机 .ips 实测（2026-09-30 23:21:29）是 com.sdhsie.westeros.weirwood。
 //   之前写的 com.sdhs.easy.high.road 是从三个 Android 商店包名**推断**的 —— 推断错了。
 //   iOS 与 Android 的 bundle id 不保证一致，这条只能靠实测。
@@ -1285,16 +1285,110 @@ static NSString *EGScanClassNames(NSArray<NSString *> *keywords, NSUInteger maxO
 // ============================================================================
 
 #define EG_ENABLE_RULES        1   // 总开关：关掉即退回纯探针
+// ★ 下面三个全是**裸名**（不含 Swift 模块前缀）。运行时一律经 EGResolveClass /
+//   EGClassNameIs 解析，绝不能直接拿去 objc_getClass / strcmp —— 见下方"类名解析"一节。
 #define EG_RULE_KEEP_TOP_VC    "MyInfoViewControllerNew"   // 唯一保留的 tab（按 topViewController 类名匹配）
+#define EG_RULE_TAB_VC         "RootTabBarController"       // 宿主底栏控制器（实测 : UITabBarController）
 
 // 广告 cell 类名（实测于「我的」页）
 #define EG_RULE_AD_CELL_CLASS  "MyInfoViewControllerBannerCell"
 #define EG_RULE_MINE_TABLE_VC  "MyInfoViewControllerNew"
 
+// 副判据：广告内部是轮播控件 ZCycleView（实测）。主判据（类名）万一因版本升级
+// 改名，这条兜底还能认出来。只在「我的」页视图树里生效。
+#define EG_RULE_AD_FALLBACK_ZCYCLE  1
+#define EG_RULE_AD_ZCYCLE_HINT      "ZCycle"
+
 static BOOL gEGRulesInstalled    = NO;
 static BOOL gEGTabBarNarrowed    = NO;
 static NSUInteger gEGTabBarCutCount = 0;
 static NSUInteger gEGAdCellHiddenCount = 0;
+
+// ============================================================================
+// ★★ 类名解析 —— v0.2.1 的核心修复（v0.2.0 就是死在这里） =================
+// ============================================================================
+//
+// 【错在哪】v0.2.0 用**裸名**做 strcmp 全等比较：
+//     objc_getClass("RootTabBarController")        -> Nil
+//     strcmp(class_getName(cls), "RootTabBarController") != 0 -> 永远不等
+//   而实测 dump 里类名的真身是：
+//     e高速.RootTabBarController / e高速.MyInfoViewControllerNew
+//   这是 **Swift 的模块名前缀**（模块名 = App 显示名，中文）。
+//   class_getName() 返回的是**带前缀的全名**，不是裸名。
+//
+// 【后果】objc_getClass 返回 Nil -> 一个钩子都没装上；
+//         每个规则函数在类名这道门上直接 return；
+//         巡检跑了 8 轮，8 轮全是空转。所以用户看到"都还在，没有改变"——
+//         **不是规则没生效，是规则从头到尾没被触发过一次**。
+//
+// 【修法】统一走下面两个函数，禁止再出现任何裸名 strcmp / objc_getClass：
+//   1. EGClassBareName() —— 取全名最后一个 '.' 之后的部分
+//   2. EGResolveClass()  —— 先裸名直取，取不到就扫全进程类表按"后缀"找
+//
+// 为什么用"最后一个点之后"而不是"子串包含"：
+//   子串包含会让 "MyInfoCell" 误配到 "MyInfoViewControllerBannerCell"，
+//   而「我的」页几乎全是 MyInfoCell —— 那会误伤一大片。后缀匹配不会。
+// ============================================================================
+
+static const char *EGClassBareName(const char *cn) {
+    if (!cn) return NULL;
+    const char *dot = strrchr(cn, '.');
+    return dot ? (dot + 1) : cn;
+}
+
+// 对象/类的类名是否等于裸名（兼容 Swift 模块前缀）
+static BOOL EGClassNameIs(id obj, const char *bare) {
+    if (!obj || !bare || !*bare) return NO;
+    @try {
+        const char *cn = class_getName([obj class]);
+        if (!cn) return NO;
+        return strcmp(EGClassBareName(cn), bare) == 0;
+    } @catch (NSException *e) { return NO; }
+}
+
+// 按裸名解析 Class。找不到返回 Nil —— 调用方保持"找不到就放弃"的纪律，不许猜父类。
+//
+// ★ 优先级：**带模块前缀的同名类 > 纯裸名类**。
+//   理由：本 App 的类一定带 "e高速." 前缀；全系统里若恰好有个第三方类叫
+//   RootTabBarController（概率极低但存在），前缀版才是我们要的那个。
+static Class EGResolveClass(const char *bare) {
+    if (!bare || !*bare) return Nil;
+
+    Class direct = objc_getClass(bare);
+    if (direct) {
+        const char *dname = class_getName(direct);
+        if (dname && strchr(dname, '.')) return direct;   // 直取命中且带前缀 = 就是它
+        // 直取命中的是裸名版：继续扫，看看有没有带模块前缀的优先版本
+    }
+
+    int total = objc_getClassList(NULL, 0);
+    if (total <= 0) return direct;
+
+    Class *all = (Class *)malloc(sizeof(Class) * (size_t)total);
+    if (!all) return direct;
+    total = objc_getClassList(all, total);
+
+    Class found = Nil;
+    for (int i = 0; i < total; i++) {
+        Class c = all[i];
+        if (!c) continue;
+        const char *nm = class_getName(c);
+        if (!nm) continue;
+        if (strcmp(EGClassBareName(nm), bare) != 0) continue;
+        if (strchr(nm, '.')) { found = c; break; }      // 带模块前缀 —— 优先
+        if (!found) found = c;                          // 裸名版 —— 备选
+    }
+    free(all);
+    if (found) return found;
+    return direct;
+}
+
+// 解析结果留痕：诊断里直接打出「裸名 -> 真名」，下次不再靠猜。
+static NSString *EGResolvedName(const char *bare) {
+    Class c = EGResolveClass(bare);
+    return c ? [NSString stringWithUTF8String:class_getName(c)]
+             : [NSString stringWithFormat:@"(未找到 %s)", bare];
+}
 
 // ---- 识别：这个 viewController 是不是"我的" ----
 // 匹配顺序刻意从最可靠到最不可靠：
@@ -1308,15 +1402,32 @@ static BOOL EGIsMineTabVC(UIViewController *vc) {
         if ([vc isKindOfClass:[UINavigationController class]]) {
             top = [(UINavigationController *)vc topViewController];
         }
-        if (top) {
-            const char *cn = class_getName([top class]);
-            if (cn && strcmp(cn, EG_RULE_KEEP_TOP_VC) == 0) return YES;
-        }
+        if (top && EGClassNameIs(top, EG_RULE_KEEP_TOP_VC)) return YES;
         // 2) title 兜底
         NSString *t = vc.tabBarItem.title;
         if (t.length && [t isEqualToString:@"我的"]) return YES;
     } @catch (NSException *e) {}
     return NO;
+}
+
+// 底栏兜底识别：**不依赖类名**。
+//   万一宿主把 RootTabBarController 改名/混淆（版本升级很常见），光靠类名又会瞎一次。
+//   指纹 = 恰好这 5 个标题且顺序完全一致 —— 这个组合在别的 tab 上撞的概率极低。
+//   即便真撞上，后果也只是"少一个 tab"，肉眼立刻可见，不会静默出错。
+static BOOL EGIsEgaosuMainTabBarByTitles(UITabBarController *tbc) {
+    static NSArray<NSString *> *want = nil;
+    if (!want) want = @[@"首页", @"车主服务", @"会员服务", @"商城", @"我的"];
+    @try {
+        NSArray *vcs = tbc.viewControllers;
+        if (!vcs || vcs.count != want.count) return NO;
+        NSMutableArray<NSString *> *got = [NSMutableArray array];
+        for (UIViewController *vc in vcs) {
+            NSString *t = vc.tabBarItem.title;
+            if (!t.length) return NO;
+            [got addObject:t];
+        }
+        return [got isEqualToArray:want];
+    } @catch (NSException *e) { return NO; }
 }
 
 // ---- 规则 1：底栏只留「我的」 ----
@@ -1325,8 +1436,9 @@ static void EGApplyTabBarRule(UITabBarController *tbc, const char *reason) {
     if (!tbc) return;
     if (![tbc isKindOfClass:[UITabBarController class]]) return;
     // 只用实测到的那个类：别人的 UITabBarController（若 App 里还有别的）不动
-    const char *cn = class_getName([tbc class]);
-    if (!cn || strcmp(cn, "RootTabBarController") != 0) return;
+    // ★ 走 EGClassNameIs —— 兼容 "e高速." 模块前缀（v0.2.0 的裸名 strcmp 在此永久失配）
+    // ★ 再加标题指纹兜底 —— 类名将来改名也不至于整条规则失效
+    if (!EGClassNameIs(tbc, EG_RULE_TAB_VC) && !EGIsEgaosuMainTabBarByTitles(tbc)) return;
 
     @try {
         NSArray *vcs = tbc.viewControllers;
@@ -1466,7 +1578,7 @@ static CGFloat EGHeightForRowHook(id self, SEL _cmd, UITableView *tv, NSIndexPat
 // 三条路径的判据与后果都写在上面的分支注释里。
 static void EGInstallHeightHook(void) {
     if (gEGHeightHookInstalled) return;
-    Class c = objc_getClass(EG_RULE_MINE_TABLE_VC);
+    Class c = EGResolveClass(EG_RULE_MINE_TABLE_VC);   // ★ 走解析，兼容 "e高速." 前缀
     if (!c) {
         EGDiag(@"[规则·行高] 找不到类 %s —— 不装（不猜父类）", EG_RULE_MINE_TABLE_VC);
         return;
@@ -1553,6 +1665,45 @@ static UITableView *EGEnclosingTableView(UIView *v, NSIndexPath **outIP) {
     return nil;
 }
 
+// 塌陷**一个**广告 cell：登记行号（供规则 3）+ hidden + 高度压到 0.5。
+// 返回 YES = 本轮真的动了这个 cell（用于统计，保证幂等计数不重复累加）。
+static BOOL EGCollapseAdCell(UIView *v, const char *why, NSUInteger *regOut) {
+    if (!v) return NO;
+    CGFloat origH = v.frame.size.height;
+    BOOL origHidden = v.hidden;
+
+    // 登记行号（供规则 3）—— 独立于"是否已隐藏"，
+    // 这样即使本轮因复用已被隐藏过，行号也不会漏登记
+    NSIndexPath *ip = nil;
+    UITableView *tv = EGEnclosingTableView(v, &ip);
+    if (tv && ip) {
+        NSString *k = EGAdRowKey(tv, ip);
+        @synchronized (@"EGAdRows") {
+            if (!gEGAdRowKeys) gEGAdRowKeys = [NSMutableSet set];
+            if (k && ![gEGAdRowKeys containsObject:k]) {
+                [gEGAdRowKeys addObject:k];
+                if (regOut) (*regOut)++;
+            }
+        }
+    }
+
+    // 幂等：已经隐藏且高度为 0 就不再动
+    if (origHidden && origH <= 0.5) return NO;
+
+    v.hidden = YES;
+    // ★ 高度设 0.5 而不是 0 —— 与 EGHeightForRowHook 同一理由：
+    //   空矩形会让本行掉出可见区域计算、cell 被回收，我们就再也扫不到它。
+    //   0.5pt 肉眼不可见，但保持"非空矩形"，身份稳定。
+    CGRect f = v.frame;
+    f.size.height = 0.5;
+    v.frame = f;
+    EGDiag(@"[规则·广告] 隐藏并塌陷 %@（判据=%s） frame=(%.0f,%.0f,%.0f,%.0f) -> h=0.5  行=%@",
+           NSStringFromClass([v class]), why,
+           f.origin.x, f.origin.y, f.size.width, origH,
+           ip ? [NSString stringWithFormat:@"%ld.%ld", (long)ip.section, (long)ip.row] : @"(未定位)");
+    return YES;
+}
+
 // ---- 规则 2：「我的」页广告位 隐藏 + 塌陷（并登记行号供规则 3 使用） ----
 // 遍历整棵视图树：
 //   · 命中广告类名的 cell -> hidden + 高度清零（"不显示"和"不占位"一起做）
@@ -1561,57 +1712,53 @@ static UITableView *EGEnclosingTableView(UIView *v, NSIndexPath **outIP) {
 static void EGApplyMineAdRule(UIView *root, const char *reason) {
 #if EG_ENABLE_RULES
     if (!root) return;
-    NSUInteger n = 0, reg = 0;
+    NSUInteger n = 0, reg = 0, zc = 0;
     @try {
+        // 副判据收集：弱键 map —— cell 被回收时条目自动消失，不会留悬垂指针
+        NSMapTable *zcCells = [NSMapTable mapTableWithKeyOptions:NSPointerFunctionsWeakMemory
+                                                   valueOptions:NSPointerFunctionsStrongMemory];
         NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
         NSUInteger guard = 0;
         while (stack.count && guard++ < 20000) {
             UIView *v = [stack lastObject];
             [stack removeLastObject];
 
-            const char *cn = class_getName([v class]);
-            if (cn && strcmp(cn, EG_RULE_AD_CELL_CLASS) == 0) {
-                CGFloat origH = v.frame.size.height;
-                BOOL origHidden = v.hidden;
-
-                // 登记行号（供规则 3）—— 独立于"是否已隐藏"，
-                // 这样即使本轮因复用已被隐藏过，行号也不会漏登记
-                NSIndexPath *ip = nil;
-                UITableView *tv = EGEnclosingTableView(v, &ip);
-                if (tv && ip) {
-                    NSString *k = EGAdRowKey(tv, ip);
-                    @synchronized (@"EGAdRows") {
-                        if (!gEGAdRowKeys) gEGAdRowKeys = [NSMutableSet set];
-                        if (k && ![gEGAdRowKeys containsObject:k]) {
-                            [gEGAdRowKeys addObject:k];
-                            reg++;
-                        }
+            // 主判据：cell 类名（兼容 Swift 模块前缀）
+            if (EGClassNameIs(v, EG_RULE_AD_CELL_CLASS)) {
+                if (EGCollapseAdCell(v, "类名", &reg)) n++;
+            }
+#if EG_RULE_AD_FALLBACK_ZCYCLE
+            // 副判据：类名换了（版本升级/混淆）也不至于全瞎。
+            //   实测广告内部是 ZCycleView（轮播）-> UICollectionView。
+            //   遇到 ZCycle* 就往上找最近的 UITableViewCell，把它当广告容器塌陷。
+            //   只在「我的」页视图树里跑（调用方已限定），影响面可控。
+            else {
+                const char *vn = class_getName([v class]);
+                if (vn && strstr(EGClassBareName(vn), EG_RULE_AD_ZCYCLE_HINT)) {
+                    UIView *p = v.superview;
+                    NSUInteger g2 = 0;
+                    while (p && g2++ < 12) {
+                        if ([p isKindOfClass:[UITableViewCell class]]) break;
+                        p = p.superview;
                     }
-                }
-
-                // 幂等：已经隐藏且高度为 0 就不再动
-                if (!origHidden || origH > 0.5) {
-                    v.hidden = YES;
-                    // ★ 高度设 0.5 而不是 0 —— 与 EGHeightForRowHook 同一理由：
-                    //   空矩形会让本行掉出可见区域计算、cell 被回收，我们就再也扫不到它。
-                    //   0.5pt 肉眼不可见，但保持"非空矩形"，身份稳定。
-                    CGRect f = v.frame;
-                    f.size.height = 0.5;
-                    v.frame = f;
-                    n++;
-                    EGDiag(@"[规则·广告] 隐藏并塌陷 %@  frame=(%.0f,%.0f,%.0f,%.0f) -> h=0.5  行=%@",
-                           NSStringFromClass([v class]),
-                           f.origin.x, f.origin.y, f.size.width, origH,
-                           ip ? [NSString stringWithFormat:@"%ld.%ld", (long)ip.section, (long)ip.row] : @"(未定位)");
+                    if (p) zcCells[p] = @"ZCycle";   // 弱键 map，天然去重
                 }
             }
+#endif
             for (UIView *sub in v.subviews) [stack addObject:sub];
         }
+
+        // 副判据收集到的容器，统一塌陷（放在遍历后 —— 避免在遍历中改 frame）
+        for (UIView *p in zcCells) {
+            if (EGCollapseAdCell(p, "ZCycle", &reg)) { n++; zc++; }
+        }
+
         if (n || reg) {
             gEGAdCellHiddenCount += n;
             EGJournal("rule-ad-ok");
-            EGDiag(@"[规则·广告] (%s) 本轮塌陷 %lu 个，新登记行号 %lu 个（累计登记 %lu）",
-                   reason, (unsigned long)n, (unsigned long)reg,
+            EGDiag(@"[规则·广告] (%s) 本轮塌陷 %lu 个（其中 ZCycle 兜底 %lu 个），"
+                    @"新登记行号 %lu 个（累计登记 %lu）",
+                   reason, (unsigned long)n, (unsigned long)zc, (unsigned long)reg,
                    (unsigned long)(gEGAdRowKeys ? gEGAdRowKeys.count : 0));
         }
     } @catch (NSException *e) {
@@ -1626,15 +1773,23 @@ static void EGApplyAllRules(UITabBarController *tbc, const char *reason) {
     EGApplyTabBarRule(tbc, reason);
 
     // 广告规则只在进入「我的」页时才跑（其他页没有这个 cell，跑了也是空转）
+    //
+    // ★ v0.2.1 删掉了 v0.2.0 那句 `strcmp(cn,"RootNavigationController")`：
+    //   它同样会撞上 Swift 模块前缀，等于又加了一道必然失配的门；
+    //   而且它本来就是多余的 —— 我们要的是"当前页是不是「我的」"，
+    //   跟外面那层导航控制器叫什么名字无关。直接问最上面那个 VC。
     UIViewController *sel = nil;
     @try { sel = tbc.selectedViewController; } @catch (NSException *e) {}
     if (!sel) return;
-    const char *cn = class_getName([sel class]);
-    if (!cn || strcmp(cn, "RootNavigationController") != 0) return;
 
-    UIViewController *top = nil;
-    @try { top = [(UINavigationController *)sel topViewController]; } @catch (NSException *e) {}
-    if (!top || strcmp(class_getName([top class]), EG_RULE_MINE_TABLE_VC) != 0) return;
+    UIViewController *top = sel;
+    if ([sel isKindOfClass:[UINavigationController class]]) {
+        @try {
+            UIViewController *t = [(UINavigationController *)sel topViewController];
+            if (t) top = t;
+        } @catch (NSException *e) {}
+    }
+    if (!EGClassNameIs(top, EG_RULE_MINE_TABLE_VC)) return;
 
     if (gEGGuardTripped) return;
     EGApplyMineAdRule(top.view, reason);
@@ -1757,10 +1912,14 @@ static BOOL EGInstallOne(Class c, SEL sel, IMP hook, const char *types,
 
 static void EGInstallRulesHooks(void) {
 #if EG_ENABLE_RULES
+    // ★ 失败**不锁死**：只要还有一个类没解析到，就允许下一轮重试。
+    //   （v0.2.0 在这里无条件 gEGRulesHooksInstalled = YES，一次失败 = 永久放弃）
     if (gEGRulesHooksInstalled) return;
-    gEGRulesHooksInstalled = YES;
 
-    Class tbc = objc_getClass("RootTabBarController");
+    Class tbc  = EGResolveClass(EG_RULE_TAB_VC);           // ★ 解析，兼容 "e高速." 前缀
+    Class mine = EGResolveClass(EG_RULE_MINE_TABLE_VC);
+    if (tbc && mine) gEGRulesHooksInstalled = YES;         // 两个都拿到才算装完
+
     if (tbc) {
         // type encoding 必须**写死**：class_addMethod 走的是 (b) 分支时需要它。
         //   "v@:"        = void (self, _cmd)
@@ -1771,19 +1930,28 @@ static void EGInstallRulesHooks(void) {
         EGInstallOne(tbc, @selector(viewWillAppear:), (IMP)EGRootTBCViewWillAppearHook,
                      "v@:B", &gEGOrigRootTBCViewWillAppear, "tbc.viewWillAppear");
     } else {
-        EGDiag(@"[规则·钩子] 找不到 RootTabBarController —— 底栏规则只能靠周期巡检");
+        EGDiag(@"[规则·钩子] 找不到 %s —— 底栏规则只能靠周期巡检（下轮重试）", EG_RULE_TAB_VC);
     }
 
-    Class mine = objc_getClass(EG_RULE_MINE_TABLE_VC);
     if (mine) {
         EGInstallOne(mine, @selector(viewWillAppear:), (IMP)EGMineViewWillAppearHook,
                      "v@:B", &gEGOrigMineViewWillAppear, "mine.viewWillAppear");
     } else {
-        EGDiag(@"[规则·钩子] 找不到 %s —— 广告规则只能靠周期巡检", EG_RULE_MINE_TABLE_VC);
+        EGDiag(@"[规则·钩子] 找不到 %s —— 广告规则只能靠周期巡检（下轮重试）", EG_RULE_MINE_TABLE_VC);
     }
 
     EGInstallHeightHook();
 #endif
+}
+
+// 类解析留痕 —— 诊断里直接输出「裸名 -> runtime 真名」。
+// 目的：让"类名对不对"这件事**一眼可判**，不用再靠推理。
+static NSString *EGClassResolutionReport(void) {
+    NSMutableString *s = [NSMutableString string];
+    [s appendFormat:@"  底栏控制器   %-30s -> %@\n", EG_RULE_TAB_VC,        EGResolvedName(EG_RULE_TAB_VC)];
+    [s appendFormat:@"  「我的」页VC  %-30s -> %@\n", EG_RULE_MINE_TABLE_VC, EGResolvedName(EG_RULE_MINE_TABLE_VC)];
+    [s appendFormat:@"  广告 cell    %-30s -> %@\n", EG_RULE_AD_CELL_CLASS,  EGResolvedName(EG_RULE_AD_CELL_CLASS)];
+    return s;
 }
 
 // ---- 周期巡检：兜住"钩子时机没赶上"的情况 ----
@@ -1798,6 +1966,9 @@ static void EGWatchMinePage(void) {
     if (gEGGuardTripped) return;
     if (gEGTabBarNarrowed && gEGAdCellHiddenCount > 0) return;   // 两条都达成 -> 收工
     gEGWatchRounds++;
+
+    // ★ 钩子还没装全 -> 每轮重试（宿主类可能在首轮之后才被加载/注册）
+    if (!gEGRulesHooksInstalled) EGInstallRulesHooks();
 
     @try {
         NSArray *tbcs = EGFindTabBarControllers();
@@ -2040,7 +2211,9 @@ static void EGCaptureFull(void) {
         [out appendFormat:@"%@\n", gEGCrashReport.length ? gEGCrashReport : @"(无崩溃记录)\n"];
 
         // ★ v0.2：规则执行状态 —— 一眼看出"改成了没有"
-        [out appendString:@"\n===== v0.2 规则状态 =====\n"];
+        [out appendString:@"\n===== 规则状态 =====\n"];
+        [out appendString:@"----- 类名解析（裸名 -> runtime 真名） -----\n"];
+        [out appendString:EGClassResolutionReport()];
         [out appendFormat:@"  底栏钩子已装   = %@\n", gEGRulesHooksInstalled ? @"是" : @"否"];
         [out appendFormat:@"  底栏已收窄     = %@（累计移除 %lu 个）\n",
             gEGTabBarNarrowed ? @"是" : @"否", (unsigned long)gEGTabBarCutCount];
